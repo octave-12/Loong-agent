@@ -160,7 +160,7 @@ class LandscapeVisualizer3D:
             metric='cosine',
             n_neighbors=30,
             min_dist=0.1,
-            random_state=42,
+            n_jobs=-1,          # 用满全部 CPU 核心
             verbose=verbose,
         )
         fit_3d = self.umap_model.fit_transform(fit_data)
