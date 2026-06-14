@@ -26,6 +26,8 @@
 | **学习器** | `loongpearl_learner.py` | Hebbian 学习 + 自知无知检测 + 衰减调度 |
 | **播种器** | `loongpearl_seeder.py` | 用 DeepSeek-R1 批量生成汉字语义关联 |
 | **龙珠主类** | `loongpearl.py` | 整合以上模块的端到端查询-推理-学习循环 |
+| **3D 可视化** | `visualize_landscape_3d.py` | 交互式能量景观 3D 可视化（等值面+锚点+轨迹） |
+| **增量渲染** | `render_trajectories.py` | 快速追加推理轨迹，复用 UMAP/网格缓存 |
 
 ---
 
@@ -35,6 +37,7 @@
 
 - Python 3.11+
 - PyTorch 2.x
+- umap-learn, plotly, numpy
 - Ollama（可选，用于知识播种和学习）
 - 8GB+ 内存
 
@@ -43,9 +46,9 @@
 ```bash
 git clone https://github.com/octave-12/loong-pearl.git
 cd loong-pearl
-pip install torch sentence-transformers requests
+pip install torch sentence-transformers requests umap-learn plotly
 
-# 下载预训练模型（二选一）
+# 下载预训练模型
 bash download_models.sh          # 从 HuggingFace 下载
 # 或自行构建（需要 Ollama + BAAI/bge-large-zh）
 ```
@@ -56,13 +59,26 @@ bash download_models.sh          # 从 HuggingFace 下载
 from loongpearl import quick_start
 
 loongpearl = quick_start()                         # 初始化
-result = loongpearl.query("人工智能")                # 查询 →
+result = loongpearl.query("人工智能")                # 查询
 # QueryResult(✅已知 conf=75.7% energy=-2.3 steps=45)
 # 「智」是知识网络中最相关的概念。（相关：能、算、机）
 
 chars = loongpearl.find_nearest_chars("算法", k=5)  # 快速检索
 info = loongpearl.reason_between("火", "水")         # 汉字间推理
 ```
+
+### 3D 能量景观可视化
+
+```bash
+# 生成交互式 3D 可视化（等值面 + 锚点散点 + 梯度下降轨迹）
+python visualize_landscape_3d.py
+# 用浏览器打开 landscape_3d.html
+
+# 追加更多推理轨迹（跳过 UMAP 降维，秒级完成）
+python render_trajectories.py
+```
+
+> 🖱️ 在 HTML 中可用鼠标旋转/缩放/平移，hover 锚点查看汉字名称和能量值
 
 ### 命令行
 
@@ -112,23 +128,31 @@ python run_seed.py --chars 3755            # 全量 GB2312 一级汉字
 - **废退（权重衰减）**：不活跃的关联逐渐弱化
 - **自知无知（元认知）**：通过梯度模长、能量值、锚点距离三信号综合判断
 
+### 3D 可视化
+使用 UMAP 将 94,117 个 1024 维锚点降到 3 维，Plotly 渲染交互式能量景观：
+- **图层1** 能量等值面 — 深蓝低能盆地（已知知识区）→ 浅色高能山脊（未知区域）
+- **图层2** 汉字锚点散点 — 红色圆点，hover 显示汉字名和能量值
+- **图层3** 梯度下降轨迹 — 彩线从随机起点到收敛锚点
+
 ---
 
 ## 📁 项目结构
 
 ```
 loong-pearl/
-├── loongpearl.py            # 龙珠主类（查询/推理/学习/持久化）
-├── zichang.py               # 字场模块（嵌入生成/检索）
-├── energy_landscape.py      # 能量景观（吸引子网络/推理引擎）
-├── loongpearl_learner.py    # 学习机制（Hebbian/自知无知/衰减）
-├── loongpearl_seeder.py     # 播种器（Ollama 批量语义关联）
-├── run_seed.py              # 播种启动脚本
-├── test_loongpearl.py       # 端到端测试
-├── download_models.sh       # 模型下载脚本
-├── hanzi_top3500.txt        # 3500 高频字表
-├── hanzi_list.txt           # 全量 94117 汉字列表
-└── doc/                     # 设计文档
+├── loongpearl.py              # 龙珠主类（查询/推理/学习/持久化）
+├── zichang.py                 # 字场模块（嵌入生成/检索）
+├── energy_landscape.py        # 能量景观（吸引子网络/推理引擎）
+├── loongpearl_learner.py      # 学习机制（Hebbian/自知无知/衰减）
+├── loongpearl_seeder.py       # 播种器（Ollama 批量语义关联）
+├── visualize_landscape_3d.py  # 3D 能量景观可视化
+├── render_trajectories.py     # 轨迹增量渲染器
+├── run_seed.py                # 播种启动脚本
+├── test_loongpearl.py         # 端到端测试
+├── download_models.sh         # 模型下载脚本
+├── hanzi_top3500.txt          # 3500 高频字表
+├── hanzi_list.txt             # 全量 94117 汉字列表
+└── doc/                       # 设计文档
 ```
 
 ---

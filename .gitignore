@@ -31,5 +31,9 @@ venv/
 Thumbs.db
 .sh
 
+# 可视化输出（大文件）
+*.html
+.vis_cache/
+
 # 训练数据
 hanzi_*.txt
