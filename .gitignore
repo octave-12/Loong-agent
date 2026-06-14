@@ -31,8 +31,7 @@ venv/
 Thumbs.db
 .sh
 
-# 可视化输出（大文件）
-*.html
+# 可视化缓存（不纳入 git）
 .vis_cache/
 
 # 训练数据
