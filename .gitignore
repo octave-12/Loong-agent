@@ -1,0 +1,35 @@
+# 龙珠 LoongPearl — 模型文件（太大，不纳入 git）
+*.pt
+
+# 播种结果和进度（运行时产物）
+*.json
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 论文 PDF（二进制大文件）
+.doc
+doc/
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+doc/
+
+# 训练数据
+hanzi_*.txt
