@@ -29,7 +29,7 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-doc/
+.sh
 
 # 训练数据
 hanzi_*.txt
