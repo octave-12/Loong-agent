@@ -869,16 +869,29 @@ class DragonBallLearner:
         
         mid_batch = torch.stack(mid_vectors)
         
+        # 冻结输入，只优化景观参数（这才是真正的"学习"）
+        mid_batch = mid_batch.detach()
+        
         with torch.no_grad():
             energy_before = self.landscape(mid_batch).mean().item()
         
-        mid_batch.requires_grad_(True)
-        optimizer = torch.optim.Adam([mid_batch], lr=learning_rate)
+        # 优化景观参数：以当前能级为基线，小步降低
+        # 关键：不能用无限最小化（会塌缩），必须锚定在当前能级附近
+        with torch.no_grad():
+            current_energy = self.landscape(mid_batch).mean().item()
+        target = current_energy - 2.0  # 只比当前深一点
         
-        energy = self.landscape(mid_batch).mean()
-        optimizer.zero_grad()
-        energy.backward()
-        optimizer.step()
+        optimizer = torch.optim.Adam(self.landscape.parameters(), lr=learning_rate * 0.001)
+        criterion = torch.nn.MSELoss()
+        target_tensor = torch.full((mid_batch.shape[0], 1), target, device=device)
+        
+        for _ in range(3):
+            energies = self.landscape(mid_batch)
+            loss = criterion(energies, target_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.01)
+            optimizer.step()
         
         for ia, ib in pairs:
             vec_a = anchors[ia].detach().to(device)
