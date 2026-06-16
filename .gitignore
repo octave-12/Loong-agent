@@ -1,38 +1,49 @@
-# 龙珠 LoongPearl — 模型文件（太大，不纳入 git）
+# 龙珠 LoongPearl — .gitignore
+
+# ── 模型文件（太大，不纳入 git）──
 *.pt
 
-# 播种结果和进度（运行时产物）
-*.json
+# ── 运行时产物（进度/缓存/参数）──
+data/runtime/*.json
 
-# Python 缓存
+# ── 播种进度和结果（大量 JSON）──
+scripts/seed/*.json
+
+# ── Python ──
 __pycache__/
 *.pyc
 *.pyo
 
-# 论文 PDF（二进制大文件）
-.doc
+# ── 音频文件（太多太大）──
+ref_audio/
+sounds/
+
+# ── 日志 ──
+logs/
+
+# ── 产出物（可视化等大文件）──
+artifacts/
+
+# ── 论文/文档（暂时不入 git）──
 doc/
 
-# 虚拟环境
+# ── 虚拟环境 ──
 .venv/
 venv/
 
-# IDE
+# ── IDE ──
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Jupyter
+# ── Jupyter ──
 .ipynb_checkpoints/
 
-# OS
+# ── OS ──
 .DS_Store
 Thumbs.db
-.sh
 
-# 可视化缓存（不纳入 git）
+# ── 缓存 ──
+.dict_cache/
 .vis_cache/
-
-# 训练数据
-hanzi_*.txt
