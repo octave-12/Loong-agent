@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 """龙珠智能接龙 v3 — 频率感知 + 死路避让 + 优先常见词"""
 import torch, json, random, math, sys, os
 
-PROJECT = "/mnt/d/soso/projects/Loong-agent/Loong-pearl"
+PROJECT = "/mnt/d/soso/projects/Loong-agent"
 
 
 from loongpearl.core.zichang import HanziAnchorField

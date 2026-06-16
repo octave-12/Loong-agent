@@ -824,6 +824,56 @@ class DragonBallLearner:
         self.total_learns += 1
         return self.hebbian.reinforce_path(query_char, answer_char, strength=strength)
     
+    def learn_pairs_batch(
+        self,
+        pairs: List[Tuple[int, int]],
+        learning_rate: float = 0.05,
+    ) -> Dict:
+        """
+        批量学习字符关联对——将成语/词语注入能量景观的核心方法。
+        
+        对于每对 (idx_a, idx_b)，取两个锚点的中点向量，
+        执行一步梯度下降降低该点的能量。
+        """
+        if not pairs:
+            return {'status': 'ok', 'pairs_learned': 0}
+        
+        anchors = self.zichang.anchors
+        mid_vectors = []
+        for ia, ib in pairs:
+            mid = (anchors[ia] + anchors[ib]) / 2
+            mid_vectors.append(mid)
+        
+        mid_batch = torch.stack(mid_vectors)
+        
+        with torch.no_grad():
+            energy_before = self.landscape(mid_batch).mean().item()
+        
+        mid_batch.requires_grad_(True)
+        optimizer = torch.optim.Adam([mid_batch], lr=learning_rate)
+        
+        energy = self.landscape(mid_batch).mean()
+        optimizer.zero_grad()
+        energy.backward()
+        optimizer.step()
+        
+        for ia, ib in pairs:
+            vec_a = anchors[ia].detach()
+            vec_b = anchors[ib].detach()
+            self.hebbian.update(vec_a, vec_b, feedback=0.3)
+        
+        with torch.no_grad():
+            energy_after = self.landscape(mid_batch).mean().item()
+        
+        self.total_learns += len(pairs)
+        
+        return {
+            'status': 'ok',
+            'pairs_learned': len(pairs),
+            'avg_energy_before': energy_before,
+            'avg_energy_after': energy_after,
+        }
+    
     def unlearn_chars(
         self,
         query_char: str,
