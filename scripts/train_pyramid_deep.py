@@ -89,60 +89,70 @@ class DeepEnergyPyramid(nn.Module):
         self.to(device)
         self.trained_levels = set()
     
-    def train_level(self, level, pairs, epochs=200, lr=0.005):
-        """训练单级 (GPU batch优化)"""
+    def train_level(self, level, pairs, epochs=200, lr=0.005, batch_size=5000):
+        """训练单级 (GPU mini-batch, CPU存储向量)"""
         projections = [self.P1, self.P2, self.P3, self.P4, self.P5]
         landscapes = [self.L1, self.L2, self.L3, self.L4, self.L5]
         proj = projections[level]
         landscape = landscapes[level]
-        
-        # 准备张量
-        vecs_a = torch.stack([p[0] for p in pairs]).to(self.device)
-        vecs_b = torch.stack([p[1] for p in pairs]).to(self.device)
         n = len(pairs)
         
-        # 生成负样本
-        perm = torch.randperm(n, device=self.device)
-        vecs_neg = vecs_b[perm]
+        # 向量保留在CPU，避免爆显存
+        vecs_a = torch.stack([p[0] for p in pairs])  # CPU
+        vecs_b = torch.stack([p[1] for p in pairs])  # CPU
+        
+        # 通过前面冻结的投影层 (CPU上分批，结果保持在CPU)
+        with torch.no_grad():
+            for p in projections[:level]:
+                p.eval().cpu()
+                results_a, results_b = [], []
+                for i in range(0, n, batch_size * 4):
+                    end = min(i + batch_size * 4, n)
+                    results_a.append(p(vecs_a[i:end].to('cpu')))
+                    results_b.append(p(vecs_b[i:end].to('cpu')))
+                vecs_a = torch.cat(results_a, dim=0)
+                vecs_b = torch.cat(results_b, dim=0)
+                p.to(self.device)
         
         optimizer = torch.optim.Adam(
             list(proj.parameters()) + list(landscape.parameters()), lr=lr)
         
-        # 通过前面冻结的投影层
-        with torch.no_grad():
-            for p in projections[:level]:
-                proj.eval()
-                vecs_a = p(vecs_a)
-                vecs_b = p(vecs_b)
-                vecs_neg = p(vecs_neg)
-        
-        proj.train()
-        landscape.train()
-        
         for epoch in range(epochs):
-            # 当前层投影
-            ha = proj(vecs_a)
-            hb = proj(vecs_b)
-            hn = proj(vecs_neg)
+            total_loss = 0.0
+            batches = 0
             
-            mid_pos = (ha + hb) / 2
-            mid_neg = (ha + hn) / 2
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                va = vecs_a[start:end].to(self.device)
+                vb = vecs_b[start:end].to(self.device)
+                bn = end - start
+                
+                perm = torch.randperm(bn, device=self.device)
+                vn = vb[perm]
+                
+                ha = proj(va)
+                hb = proj(vb)
+                hn = proj(vn)
+                
+                mid_pos = (ha + hb) / 2
+                mid_neg = (ha + hn) / 2
+                
+                e_pos = landscape(mid_pos).squeeze(-1)
+                e_neg = landscape(mid_neg).squeeze(-1)
+                
+                loss = F.relu(2.0 + e_pos - e_neg).mean()
+                
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(list(proj.parameters()) + list(landscape.parameters()), 1.0)
+                optimizer.step()
+                
+                total_loss += loss.item()
+                batches += 1
             
-            e_pos = landscape(mid_pos).squeeze(-1)
-            e_neg = landscape(mid_neg).squeeze(-1)
-            
-            loss = F.relu(2.0 + e_pos - e_neg).mean()
-            
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(list(proj.parameters()) + list(landscape.parameters()), 1.0)
-            optimizer.step()
-            
-            if epoch % 50 == 0:
-                print(f"  L{level+1} e{epoch}: loss={loss.item():.4f} "
-                      f"e_pos={e_pos.mean().item():.1f} e_neg={e_neg.mean().item():.1f}")
+            if epoch % 25 == 0:
+                print(f"  L{level+1} e{epoch}: loss={total_loss/batches:.4f}")
         
-        # 冻结
         proj.eval()
         landscape.eval()
         for p in proj.parameters():
@@ -151,24 +161,21 @@ class DeepEnergyPyramid(nn.Module):
             p.requires_grad = False
         self.trained_levels.add(level)
         
-        return loss.item()
+        return total_loss / batches if batches > 0 else 999
     
     def forward_all(self, va, vb):
-        """6级前向传播"""
+        """6级前向传播 — 每级在对应投影后评估"""
         with torch.no_grad():
-            h = [va.to(self.device), vb.to(self.device)]
+            h = va.to(self.device), vb.to(self.device)
+            energies = []
             
             for i, proj in enumerate([self.P1, self.P2, self.P3, self.P4, self.P5]):
-                h[0] = proj(h[0])
-                h[1] = proj(h[1])
-            
-            energies = []
-            landscapes = [self.L1, self.L2, self.L3, self.L4, self.L5]
-            # 注意: L1在P1之后评估, L2在P2之后评估...
-            # 简化: 在最终状态评估
-            final_mid = (h[0] + h[1]) / 2
-            for ls in landscapes:
-                e = ls(final_mid.unsqueeze(0) if final_mid.dim() == 1 else final_mid)
+                h = (proj(h[0]), proj(h[1]))
+                ls = [self.L1, self.L2, self.L3, self.L4, self.L5][i]
+                mid = (h[0] + h[1]) / 2
+                if mid.dim() == 1:
+                    mid = mid.unsqueeze(0)
+                e = ls(mid)
                 energies.append(e.item() if e.numel() == 1 else e.mean().item())
             
             return energies
@@ -221,28 +228,58 @@ def main():
     field = HanziAnchorField.load(
         os.path.join(PROJECT, 'data/models/zichang_94117_1024d.pt'), freeze=True)
     
-    cg = ConceptGraph(field)
+    # 只加载概念图的文本结构(JSON), 不加载嵌入文件(省455MB反序列化)
+    import json
     cg_path = os.path.join(PROJECT, 'data/models/concept_graph')
-    if os.path.exists(cg_path + '.json'):
-        cg.load(cg_path)
+    cg_json = cg_path + '.json'
+    triples_data = []
+    if os.path.exists(cg_json):
+        with open(cg_json, encoding='utf-8') as f:
+            data = json.load(f)
+            triples_data = data.get('triples', [])
+    print(f"   从JSON加载: {len(triples_data)}条三元组 (跳过455MB嵌入文件)")
     
     # 创建金字塔
     pyramid = DeepEnergyPyramid(field, device=device)
     params = sum(p.numel() for p in pyramid.parameters())
     print(f"   金字塔参数: {params:,} (~{params/1e6:.1f}M)")
     
-    # 准备训练对
-    print("\n准备训练数据...")
+    # 直接从字场计算词嵌入(预计算所有唯一词, 避免重复)
+    print("\\n准备训练对 (从字场直接计算嵌入, 预计算缓存)...")
+    t0 = time.time()
+    
+    # 收集所有唯一词
+    unique_words = set()
+    for td in triples_data:
+        if td.get('c', 0.5) >= 0.3:
+            unique_words.add(td['s'])
+            unique_words.add(td['o'])
+    
+    # 预计算所有唯一词的嵌入
+    word_emb = {}
+    for word in unique_words:
+        chars = [ch for ch in word if ch in field._char_to_idx]
+        if chars:
+            word_emb[word] = field.anchors[[field._char_to_idx[ch] for ch in chars]].mean(dim=0)
+    print(f"   预计算: {len(word_emb)}个词嵌入 ({time.time()-t0:.1f}s)")
+    
+    # 构建训练对
     pairs = []
-    for t in cg.triples.values():
-        if t.confidence < 0.3:
+    for td in triples_data:
+        if td.get('c', 0.5) < 0.3:
             continue
-        va = cg.get_embedding(t.subject)
-        vb = cg.get_embedding(t.object)
+        va = word_emb.get(td['s'])
+        vb = word_emb.get(td['o'])
         if va is not None and vb is not None:
             pairs.append((va, vb))
+    print(f"   构建: {len(pairs)}对 ({time.time()-t0:.1f}s)")
     
-    print(f"   训练对: {len(pairs)}")
+    # 采样
+    if len(pairs) > 20000:
+        import random
+        random.seed(42)
+        pairs = random.sample(pairs, 20000)
+        print(f"   采样至: {len(pairs)}")
     
     # 逐级训练
     for level in range(args.level, 5):
@@ -262,12 +299,15 @@ def main():
     pyramid.save(save_path)
     
     # 推理测试
-    print(f"\n🔍 6级推理测试:")
+    print(f"\\n🔍 6级推理测试:")
     test_pairs = [("电子","原子"), ("细胞","器官"), ("数学","物理")]
     for a, b in test_pairs:
-        va = cg.get_embedding(a)
-        vb = cg.get_embedding(b)
-        if va is not None and vb is not None:
+        # 直接从字场计算嵌入
+        ca = [c for c in a if c in field._char_to_idx]
+        cb = [c for c in b if c in field._char_to_idx]
+        if ca and cb:
+            va = field.anchors[[field._char_to_idx[c] for c in ca]].mean(dim=0)
+            vb = field.anchors[[field._char_to_idx[c] for c in cb]].mean(dim=0)
             energies = pyramid.forward_all(va, vb)
             print(f"  {a}→{b}: " + " ".join(f"L{i+1}={e:.1f}" for i, e in enumerate(energies)))
     
