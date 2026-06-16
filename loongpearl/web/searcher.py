@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-龙珠全网搜索引擎 (searcher.py)
-==============================
-多引擎实时搜索，为龙珠提供"现场学习"能力。
+龙珠全网搜索引擎 (searcher.py) — 多源并发能量获取
+==================================================
+
+能量获取三原则（核心宪法）：
+  1. 多源并发 — 永不依赖单一信息源
+     Bing → DuckDuckGo → 百度百科 → Google → Wikipedia
+     并发生效，首个返回有效结果即用，不因单源故障放弃
+  2. 级联回退 — 每层都有兜底
+     HTML解析 → JSON API → 缓存 → idioms.json本地词典
+     互联网不通时用本地知识兜底，但绝不因本地够用就放弃网络
+  3. 正文提取 — 不只依赖摘要
+     搜索结果 → 点开原文 → 提取正文段落 → 字对提取
+     摘要太短（通常<150字），原文才能提取高质量相邻字对
+     互联网有无限可能，每篇网页都是潜在的能量来源
 
 设计原则:
-  - 多源并发: 同时查询多个搜索引擎，取交集/并集
-  - 级联回退: 主源失败 → 备源 → 兜底
-  - 本地缓存: 已搜过的结果缓存，避免重复请求
-  - 结果提取: 自动提取摘要、关键信息、结构化数据
-
-支持的知识类型:
-  - 成语/词语释义 (百度百科、汉典、词典网)
-  - 事实查询 (维基、百科)
-  - 通用搜索 (DuckDuckGo、Bing)
-  - 中文优化 (优先中文源)
+  - 多源并发: ThreadPoolExecutor并行查询，竞速取结果
+  - 级联回退: 引擎 → API → 缓存 → 本地词典
+  - 正文提取: 不只读snippet，尝试获取全文
+  - 本地缓存: 已搜结果缓存，避免重复请求
 
 用法:
     searcher = WebSearcher()
@@ -85,6 +90,13 @@ class WebSearcher:
     # 搜索引擎配置 (按优先级)
     ENGINES = [
         {
+            'name': 'bing',
+            'domain': 'zh',
+            'url': 'https://www.bing.com/search',
+            'params': lambda q: {'q': q, 'cc': 'cn', 'setlang': 'zh-Hans', 'count': '10'},
+            'result_pattern': None,
+        },
+        {
             'name': 'baidu',
             'domain': 'zh',
             'url': 'https://www.baidu.com/s',
@@ -113,6 +125,13 @@ class WebSearcher:
                 'action': 'query', 'list': 'search', 'srsearch': q,
                 'format': 'json', 'srlimit': 5, 'srprop': 'snippet',
             },
+            'result_pattern': None,
+        },
+        {
+            'name': 'google',
+            'domain': 'global',
+            'url': 'https://www.google.com/search',
+            'params': lambda q: {'q': q, 'hl': 'zh-CN', 'num': '10'},
             'result_pattern': None,
         },
     ]
@@ -154,9 +173,10 @@ class WebSearcher:
     
     def search(self, query: str, max_results: int = 8) -> SearchResponse:
         """
-        全网搜索一个知识查询。
+        全网并发搜索——多引擎竞速，永不依赖单一源。
         
-        自动检测知识域，选择最优搜索引擎组合。
+        自动检测知识域，并发查询全部可用引擎，
+        首个返回结果即合并，不因单源故障阻塞。
         
         Args:
             query: 搜索查询
@@ -177,25 +197,43 @@ class WebSearcher:
         
         response = SearchResponse()
         
-        # 根据知识域选择搜索引擎
+        # 获取全部可用引擎
         engines = self._select_engines(domain)
+        per_engine = max(2, max_results // len(engines))
         
-        # 并发查询（串行，避免被封）
+        # 并发查询：多引擎同时发出请求，单个引擎超时不阻塞其他
         all_results = []
-        for engine in engines:
-            try:
-                results = self._query_engine(engine, query, max_results // len(engines))
-                all_results.extend(results)
-            except Exception:
-                continue
+        engine_errors = []
         
-        # 去重 + 排序
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def _query_one(engine):
+            try:
+                return self._query_engine(engine, query, per_engine)
+            except Exception as e:
+                engine_errors.append(f"{engine['name']}: {e}")
+                return []
+        
+        with ThreadPoolExecutor(max_workers=len(engines)) as pool:
+            futures = {pool.submit(_query_one, e): e for e in engines}
+            for future in as_completed(futures, timeout=self.timeout + 2):
+                try:
+                    results = future.result()
+                    all_results.extend(results)
+                except Exception:
+                    pass
+        
+        # 去重 + 按来源排序（Bing优先）
         seen_urls = set()
         unique = []
         for r in all_results:
             if r.url not in seen_urls:
                 seen_urls.add(r.url)
                 unique.append(r)
+        
+        # 按来源优先级排序（Bing > DDG > 其他）
+        source_order = {'bing': 0, 'duckduckgo': 1, 'baidu_baike': 2, 'google': 3}
+        unique.sort(key=lambda r: source_order.get(r.source, 99))
         
         response.results = unique[:max_results]
         response.sources = list(set(r.source for r in response.results))
@@ -257,6 +295,8 @@ class WebSearcher:
             return self._search_ddg(query, limit)
         elif name == 'bing':
             return self._search_bing(query, limit)
+        elif name == 'google':
+            return self._search_google(query, limit)
         elif name == 'wikipedia_zh':
             return self._search_wikipedia(query, limit)
         elif name == 'baidu_baike':
@@ -396,6 +436,48 @@ class WebSearcher:
         except Exception:
             return []
     
+    def _search_google(self, query: str, limit: int) -> List[SearchResult]:
+        """Google 搜索（WSL下可能不通，作为备选）"""
+        try:
+            r = self.session.get(
+                'https://www.google.com/search',
+                params={'q': query, 'hl': 'zh-CN', 'num': limit},
+                timeout=self.timeout,
+            )
+            if r.status_code != 200:
+                return []
+            
+            results = []
+            html = r.text
+            
+            # Google 结果格式: <div class="g"> ... <h3>标题</h3> ... <div class="VwiC3b">摘要</div>
+            blocks = re.findall(
+                r'<div[^>]*class="g"[^>]*>(.*?)</div>\s*</div>\s*</div>',
+                html, re.DOTALL
+            )
+            
+            for block in blocks[:limit]:
+                m = re.search(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+                if not m:
+                    continue
+                url, title = m.group(1), re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                
+                snippet = ''
+                m2 = re.search(r'<div[^>]*class="[^"]*VwiC3b[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+                if not m2:
+                    m2 = re.search(r'<span[^>]*class="[^"]*st[^"]*"[^>]*>(.*?)</span>', block, re.DOTALL)
+                if m2:
+                    snippet = re.sub(r'<[^>]+>', '', m2.group(1)).strip()[:300]
+                
+                results.append(SearchResult(
+                    title=title, url=url, snippet=snippet,
+                    source='google', relevance=0.6
+                ))
+            
+            return results
+        except Exception:
+            return []
+    
     def _search_wikipedia(self, query: str, limit: int) -> List[SearchResult]:
         """维基百科 API 搜索"""
         try:
@@ -486,13 +568,11 @@ class WebSearcher:
         return 'general'
     
     def _select_engines(self, domain: str) -> List[dict]:
-        """根据知识域选择搜索引擎"""
-        if domain == 'idiom':
-            return [e for e in self.ENGINES if e['name'] in ('baidu', 'baidu_baike', 'wikipedia_zh', 'duckduckgo')]
-        elif domain == 'character':
-            return [e for e in self.ENGINES if e['name'] in ('baidu', 'baidu_baike', 'wikipedia_zh', 'duckduckgo')]
-        else:
-            return [e for e in self.ENGINES if e['name'] in ('baidu', 'wikipedia_zh', 'duckduckgo')]
+        """全引擎并发——互联网有无限可能，永不局限单一源"""
+        # 返回所有引擎，并发时自动竞速取结果
+        # 优先序已在结果去重时处理
+        return [e for e in self.ENGINES if e['name'] in 
+                ('bing', 'duckduckgo', 'baidu_baike', 'google', 'wikipedia_zh')]
     
     def _synthesize_answer(self, query: str, results: List[SearchResult], domain: str) -> str:
         """从搜索结果综合回答"""

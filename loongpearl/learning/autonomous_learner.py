@@ -73,10 +73,35 @@ class AutonomousLearner:
         self.learner = learner
         self.searcher = WebSearcher(timeout=8, cache_enabled=True)
         
+        # 概念图（可选，惰性加载）
+        self._concept_graph = None
+        
         # 统计
         self.total_learned = 0
         self.total_searched = 0
         self.total_injected = 0
+        self.total_concept_triples = 0
+    
+    @property
+    def concept_graph(self):
+        """惰性加载概念图"""
+        if self._concept_graph is None:
+            from loongpearl.core.concept_graph import ConceptGraph
+            import os as _os
+            self._concept_graph = ConceptGraph(self.zichang, self.landscape)
+            # 尝试加载持久化概念图
+            cg_path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                'data', 'models', 'concept_graph'
+            )
+            if _os.path.exists(cg_path + '.json'):
+                try:
+                    self._concept_graph.load(cg_path)
+                except Exception:
+                    # 加载失败：重新构建
+                    self._concept_graph.seed_all_domains()
+                    self._concept_graph.induce()
+        return self._concept_graph
     
     # ── 公开 API ──────────────────────────────────────────────
     
@@ -139,6 +164,26 @@ class AutonomousLearner:
             result['status'] = 'search_failed'
             result['message'] = '搜索到结果但无法提取字对关联'
             return result
+        
+        # 步骤3.5: 概念提取 —— 从搜索结果中挖掘概念三元组
+        try:
+            concept_triples = self.concept_graph.extract_from_search_results(search_results)
+            if concept_triples:
+                self.total_concept_triples += len(concept_triples)
+                result['concept_triples'] = len(concept_triples)
+        except Exception as e:
+            pass  # 概念提取失败不阻断学习
+
+        # 步骤3.6: 复合词提取 —— 从搜索结果中识别新词并加入概念图
+        try:
+            new_words = self._extract_compound_words(search_results)
+            if new_words:
+                for word in new_words:
+                    if word not in self.concept_graph.nodes:
+                        self.concept_graph.add_node(word)
+                result['new_words'] = len(new_words)
+        except Exception as e:
+            pass  # 词提取失败不阻断学习
         
         # 步骤4: 注入 —— Hebbian 学习写入能量景观
         energy_before = result.get('energy_before')
@@ -330,6 +375,49 @@ class AutonomousLearner:
         
         return pairs
     
+    def _extract_compound_words(self, search_results) -> List[str]:
+        """
+        从搜索结果中提取2-4字复合词。
+
+        策略: 高频连续中文字符序列 → 候选词
+        过滤: 必须在字场中有所有字符，且长度>=2
+        """
+        import re as _re
+        from collections import Counter as _Counter
+
+        all_text = ''
+        if hasattr(search_results, 'results'):
+            for r in search_results.results[:5]:
+                if hasattr(r, 'snippet'):
+                    all_text += ' ' + (r.snippet or '')
+                elif hasattr(r, 'text'):
+                    all_text += ' ' + (r.text or '')
+        elif hasattr(search_results, 'answer'):
+            all_text += ' ' + (search_results.answer or '')
+
+        if not all_text.strip():
+            return []
+
+        # 提取连续中文字符
+        cn_chars = _re.findall(r'[\u4e00-\u9fff]+', all_text)
+        word_counter = _Counter()
+
+        for segment in cn_chars:
+            for length in [2, 3, 4]:
+                for i in range(len(segment) - length + 1):
+                    candidate = segment[i:i + length]
+                    # 过滤：必须全部汉字在字场中
+                    if all(c in self.zichang._char_to_idx for c in candidate):
+                        word_counter[candidate] += 1
+
+        # 取高频词（出现>=2次或长度>=3的高信息量词）
+        new_words = []
+        for word, freq in word_counter.most_common(30):
+            if freq >= 2 or len(word) >= 3:
+                new_words.append(word)
+
+        return new_words
+
     def _inject_pairs(
         self,
         pairs: List[Tuple[int, int]],
@@ -359,6 +447,21 @@ class AutonomousLearner:
         
         result = self.learner.learn_pairs_batch(pairs, learning_rate=lr)
         return result.get('pairs_learned', len(pairs))
+    
+    def save_concept_graph(self) -> bool:
+        """保存概念图到磁盘"""
+        if self._concept_graph is None:
+            return False
+        try:
+            import os as _os
+            cg_path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                'data', 'models', 'concept_graph'
+            )
+            self._concept_graph.save(cg_path)
+            return True
+        except Exception:
+            return False
 
 
 # ============================================================================

@@ -210,62 +210,95 @@ class AutoLearningDaemon:
     
     def learn_one(self, gap: BlindSpot) -> dict:
         """
-        学习一个盲区。
+        学习一个盲区——不再只搜单字，而是搜该字的词语簇。
         
-        搜索策略基于因子类型:
-          - 死路因子 → 搜索 "{char}字开头的成语"
-          - 统计因子 → 搜索 "{char} 成语 接龙"
-          - 覆盖因子 → 搜索 "{char} 成语 用法"
-          - 其他 → 搜索 "{char} 是什么意思"
+        搜索策略:
+          - 死路因子 → 搜索该字开头的成语
+          - 梯度因子 → 三连搜: 成语+组词+常见搭配
+          - 语义因子 → 搜索该字及其关联字的组合词
+          - 其他 → 组词优先
         """
         char = gap.char
         factor = gap.factor
         
-        # 构造搜索查询
+        # 构造多查询——不是搜孤立的字，而是搜字在词语中的用法
+        queries = []
         if factor == 'dead_end':
-            query = f"{char}字开头的成语有哪些"
+            queries = [f"{char}字开头的成语有哪些", f"{char}成语大全"]
+        elif factor == 'gradient':
+            # 梯度异常的字：搜成语 + 组词 + 常见搭配，三管齐下
+            queries = [
+                f"{char} 成语 释义",           # 成语层面
+                f"{char}字 组词 常见词语",      # 词语层面
+                f"含有{char}字的词语 成语",     # 包含该字的词
+            ]
+        elif factor == 'semantic':
+            related = gap.evidence.get('related_char', '') if isinstance(gap.evidence, dict) else ''
+            if related:
+                queries = [
+                    f"{char}{related} 成语 词语",      # 关联字组合
+                    f"{char}和{related} 成语 组词",     # 两者关系
+                ]
+            else:
+                queries = [f"{char} 组词 成语 搭配"]
         elif factor == 'statistical':
-            query = f"{char} 成语接龙 开头"
+            queries = [f"{char} 成语接龙", f"{char}字 常见词语"]
         elif factor == 'coverage':
-            query = f"{char} 成语 用法 释义"
+            queries = [f"{char} 成语 用法 释义", f"{char} 组词"]
         elif factor == 'freshness':
-            query = f"{char}字 组词 成语"
+            queries = [f"{char}字 组词 新词语"]
         else:
-            query = f"{char} 成语 释义 出处"
+            queries = [f"{char} 组词 成语 搭配"]
         
-        log.info(f"\n  📖 学习: '{char}' [{factor}] → {query}")
+        # 合并所有查询结果
+        all_pairs = 0
+        total_results = []
+        for query in queries:
+            log.info(f"\n  📖 学习: '{char}' [{factor}] → {query}")
+            
+            t0 = time.time()
+            result = self.autonomous.learn_if_unknown(
+                query_text=query,
+                query_vec=None,
+                auto_search=True,
+            )
+            elapsed = time.time() - t0
+            
+            pairs = result.get('pairs_learned', 0)
+            all_pairs += pairs
+            total_results.append(result)
+            
+            if result['status'] == 'learned':
+                log.info(f"    ✅ {query[:20]}... 注入{pairs}对 | {elapsed:.1f}s")
+            else:
+                log.info(f"    ⚠️ {result['status']}: {result.get('message','')[:40]} | {elapsed:.1f}s")
         
-        t0 = time.time()
-        result = self.autonomous.learn_if_unknown(
-            query_text=query,
-            query_vec=None,
-            auto_search=True,
-        )
-        elapsed = time.time() - t0
+        # 合并记录（取第一次搜索的结果状态）
+        primary = total_results[0] if total_results else {'status': 'search_failed', 'pairs_learned': 0}
         
         # 记录
         log_entry = {
             'char': char,
             'factor': factor,
             'score': gap.score,
-            'query': query,
-            'status': result['status'],
-            'pairs_learned': result.get('pairs_learned', 0),
-            'sources': result.get('sources', []),
-            'time': elapsed,
+            'queries': queries,
+            'status': primary['status'],
+            'pairs_learned': all_pairs,
+            'sources': primary.get('sources', []),
+            'time': time.time(),
             'timestamp': time.time(),
         }
         self.learned_history.append(log_entry)
         
-        if result['status'] == 'learned':
-            injected = result.get('pairs_learned', 0)
-            self.total_injected_pairs += injected
-            log.info(f"    ✅ 学会: 注入{injected}对 | {elapsed:.1f}s")
+        self.total_injected_pairs += all_pairs
+        
+        if all_pairs > 0:
+            log.info(f"    ✅ 学会: 共{len(queries)}次搜索 注入{all_pairs}对")
         else:
-            log.info(f"    ⚠️ {result['status']}: {result.get('message','')} | {elapsed:.1f}s")
+            log.info(f"    ⚠️ {primary['status']}: {primary.get('message','')[:40]}")
         
         self.total_learned += 1
-        return result
+        return primary
     
     def run_round(self):
         """执行一轮完整循环"""
@@ -309,10 +342,20 @@ class AutoLearningDaemon:
         except Exception:
             pass
         
-        # 4. 保存
-        save_path = os.path.join(PROJECT, 'data/models/energy_landscape_1024d.pt')
-        self.landscape.save(save_path)
-        self._save_learn_log()
+        # 4. 保存——只在真正学到新知识时保存（防止无效覆盖已注入的深盆地）
+        if learned_this_round > 0:
+            save_path = os.path.join(PROJECT, 'data/models/energy_landscape_1024d.pt')
+            self.landscape.save(save_path)
+            self._save_learn_log()
+            # 同时保存概念图（如果有新提取的三元组）
+            if hasattr(self, 'autonomous') and self.autonomous.total_concept_triples > 0:
+                try:
+                    self.autonomous.save_concept_graph()
+                except Exception:
+                    pass
+            log.info(f"  💾 模型已保存 ({learned_this_round}字, 本轮注入{self.total_injected_pairs}对)")
+        else:
+            self._save_learn_log()  # 仍保存学习记录（失败原因等）
         
         # 5. 课程推进（每轮尝试，不抛异常不影响主流程）
         try:
@@ -329,6 +372,68 @@ class AutoLearningDaemon:
                 except Exception:
                     pass
         except Exception:
+            pass
+        
+        # 6. 定期跨学科桥接（每5轮自动运行一次）
+        try:
+            bridge_interval = getattr(self, '_last_bridge_round', 0)
+            if self.rounds - bridge_interval >= 5:
+                self._last_bridge_round = self.rounds
+                log.info(f"  🌉 第 {self.rounds} 轮: 自动跨学科桥接...")
+                from loongpearl.core.cross_domain_bridge import CrossDomainBridgeEngine
+                from loongpearl.core.concept_graph import ConceptGraph
+                cg = self.autonomous.concept_graph
+                engine = CrossDomainBridgeEngine(self.field, self.landscape, cg)
+                bridges = engine.build_all_bridges(min_confidence=0.3, max_bridges=50)
+                n_added = engine.add_bridges_to_concept_graph(bridges, min_confidence=0.4)
+                if n_added > 0:
+                    cg.induce()
+                    self.autonomous.save_concept_graph()
+                    report = cg.evaluate()
+                    log.info(f"  🌉 桥接完成: +{n_added}桥, 连通性:{report['connectivity']:.3f}, "
+                            f"三元组:{report['triples']}")
+        except Exception as e:
+            pass
+        
+        # 7. 定期剪枝（每20轮，清除积累的低质量推断）
+        try:
+            prune_interval = getattr(self, '_last_prune_round', -20)
+            if self.rounds - prune_interval >= 20:
+                self._last_prune_round = self.rounds
+                cg = self.autonomous.concept_graph
+                removed = cg.prune(min_confidence=0.1, min_evidence=0)
+                if removed > 0:
+                    self.autonomous.save_concept_graph()
+                    log.info(f"  ✂️ 剪枝: 移除{removed}条低质量三元组, 剩余{cg.total_triples}条")
+
+            # 剪枝后对齐：将高置信度概念图知识写入能量景观
+            if self.rounds - prune_interval >= 20:
+                cg = self.autonomous.concept_graph
+                aligned = cg.align_to_landscape(
+                    learner=self.learner,
+                    min_confidence=0.6,
+                    max_pairs=100,
+                    learning_rate=0.01,
+                )
+                if aligned > 0:
+                    log.info(f"  🎯 知识对齐: {aligned}对概念映射到能量景观")
+        except Exception as e:
+            pass
+
+        # 8. 定期闭环验证（每10轮自动验证一次推断三元组）
+        try:
+            verify_interval = getattr(self, '_last_verify_round', -10)
+            if self.rounds - verify_interval >= 10:
+                self._last_verify_round = self.rounds
+                cg = self.autonomous.concept_graph
+                from loongpearl.learning.verify_loop import VerifyLoop
+                vf = VerifyLoop(cg)
+                v_report = vf.verify_lowest_confidence(n=5)
+                if v_report['confirmed'] > 0 or v_report['contradicted'] > 0:
+                    self.autonomous.save_concept_graph()
+                    log.info(f"  🔄 闭环验证: 确认{v_report['confirmed']}条 "
+                            f"矛盾{v_report['contradicted']}条 不确定{v_report['uncertain']}条")
+        except Exception as e:
             pass
         
         stats = self.detector.get_stats()
@@ -367,6 +472,12 @@ class AutoLearningDaemon:
         save_path = os.path.join(PROJECT, 'data/models/energy_landscape_1024d.pt')
         self.landscape.save(save_path)
         self._save_learn_log()
+        # 最终保存概念图
+        if hasattr(self, 'autonomous'):
+            try:
+                self.autonomous.save_concept_graph()
+            except Exception:
+                pass
         
         log.info(f"\n📊 最终统计:")
         log.info(f"   总轮数: {self.rounds}")
@@ -392,6 +503,25 @@ class AutoLearningDaemon:
 # ============================================================================
 
 def main():
+    # 单例锁：防止重复启动
+    PID_FILE = os.path.join(PROJECT, 'logs/auto_learn.pid')
+    try:
+        with open(PID_FILE) as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+            print(f"❌ 守护进程已在运行 (PID {old_pid})，先 kill {old_pid} 再重试")
+            sys.exit(1)
+        except OSError:
+            pass  # 旧进程已死
+    except (FileNotFoundError, ValueError):
+        pass
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    # 注册退出清理
+    import atexit
+    atexit.register(lambda: os.path.exists(PID_FILE) and os.remove(PID_FILE))
+    
     parser = argparse.ArgumentParser(
         description='龙珠 7×24 自主学习守护进程',
         formatter_class=argparse.RawDescriptionHelpFormatter,

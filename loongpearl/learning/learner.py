@@ -852,62 +852,91 @@ class DragonBallLearner:
         learning_rate: float = 0.05,
     ) -> Dict:
         """
-        批量学习字符关联对——将成语/词语注入能量景观的核心方法。
+        批量学习字符关联对——对比学习版本。
         
-        对于每对 (idx_a, idx_b)，取两个锚点的中点向量，
-        执行一步梯度下降降低该点的能量。
+        不再使用MSE全局目标（会抹平景观），改用对比损失：
+          - 已知字对 → 降低中点能量（形成盆地）
+          - 随机字对 → 保持/升高能量（作为负样本）
+        
+        损失 = ranking_loss(已知 < 随机 + margin) + push_loss(已知 < target_low)
         """
+        import random as _random
+        
         if not pairs:
             return {'status': 'ok', 'pairs_learned': 0}
         
         anchors = self.anchors.anchors
         device = next(self.landscape.parameters()).device
-        mid_vectors = []
+        n_anchors = len(anchors)
+        n_known = len(pairs)
+        
+        # 已知字对中点
+        mid_known = []
         for ia, ib in pairs:
-            mid = (anchors[ia] + anchors[ib]) / 2
-            mid_vectors.append(mid.to(device))
+            mid_known.append(((anchors[ia] + anchors[ib]) / 2).to(device))
+        mid_known = torch.stack(mid_known).detach()
         
-        mid_batch = torch.stack(mid_vectors)
-        
-        # 冻结输入，只优化景观参数（这才是真正的"学习"）
-        mid_batch = mid_batch.detach()
+        # 随机字对中点（负样本）
+        mid_random = []
+        for _ in range(n_known):
+            ia = _random.randint(0, n_anchors - 1)
+            ib = _random.randint(0, n_anchors - 1)
+            mid_random.append(((anchors[ia] + anchors[ib]) / 2).to(device))
+        mid_random = torch.stack(mid_random).detach()
         
         with torch.no_grad():
-            energy_before = self.landscape(mid_batch).mean().item()
+            energy_known_before = self.landscape(mid_known).mean().item()
+            energy_random_before = self.landscape(mid_random).mean().item()
+            separation_before = energy_random_before - energy_known_before
         
-        # 优化景观参数：以当前能级为基线，小步降低
-        # 关键：不能用无限最小化（会塌缩），必须锚定在当前能级附近
-        with torch.no_grad():
-            current_energy = self.landscape(mid_batch).mean().item()
-        target = current_energy - 2.0  # 只比当前深一点
+        # 对比学习：已知对能量必须低于随机对
+        optimizer = torch.optim.Adam(self.landscape.parameters(), lr=learning_rate * 0.01)
+        margin = 3.0       # 已知对比随机对至少低3.0
+        target_low = -15.0  # 已知对目标能级
         
-        optimizer = torch.optim.Adam(self.landscape.parameters(), lr=learning_rate * 0.001)
-        criterion = torch.nn.MSELoss()
-        target_tensor = torch.full((mid_batch.shape[0], 1), target, device=device)
-        
-        for _ in range(3):
-            energies = self.landscape(mid_batch)
-            loss = criterion(energies, target_tensor)
+        for _ in range(5):
+            e_known = self.landscape(mid_known)
+            e_random = self.landscape(mid_random)
+            
+            # 排序损失：已知必须低于随机至少margin
+            rank_loss = torch.nn.functional.relu(
+                e_known - e_random + margin
+            ).mean()
+            
+            # 下推损失：已知对能量要低于target_low
+            push_loss = torch.nn.functional.relu(
+                e_known - target_low
+            ).mean()
+            
+            loss = rank_loss + 0.3 * push_loss
+            
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.01)
+            torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.05)
             optimizer.step()
         
+        # 单对 Hebbian 精细调节
         for ia, ib in pairs:
             vec_a = anchors[ia].detach().to(device)
             vec_b = anchors[ib].detach().to(device)
             self.hebbian.update(vec_a, vec_b, feedback=0.3)
         
         with torch.no_grad():
-            energy_after = self.landscape(mid_batch).mean().item()
+            energy_known_after = self.landscape(mid_known).mean().item()
+            energy_random_after = self.landscape(mid_random).mean().item()
+            separation_after = energy_random_after - energy_known_after
         
         self.total_learns += len(pairs)
         
         return {
             'status': 'ok',
             'pairs_learned': len(pairs),
-            'avg_energy_before': energy_before,
-            'avg_energy_after': energy_after,
+            'avg_energy_known_before': energy_known_before,
+            'avg_energy_known_after': energy_known_after,
+            'avg_energy_random_before': energy_random_before,
+            'avg_energy_random_after': energy_random_after,
+            'separation_before': separation_before,
+            'separation_after': separation_after,
         }
     
     def unlearn_chars(

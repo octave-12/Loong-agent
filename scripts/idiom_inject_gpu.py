@@ -29,6 +29,24 @@ PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def main():
+    # 单例锁：防止重复启动
+    import atexit
+    PID_FILE = os.path.join(PROJECT, 'logs/idiom_inject.pid')
+    try:
+        with open(PID_FILE) as f:
+            old_pid = int(f.read().strip())
+        try:
+            os.kill(old_pid, 0)
+            print(f"❌ 注入进程已在运行 (PID {old_pid})，先 kill {old_pid} 再重试")
+            sys.exit(1)
+        except OSError:
+            pass
+    except (FileNotFoundError, ValueError):
+        pass
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    atexit.register(lambda: os.path.exists(PID_FILE) and os.remove(PID_FILE))
+    
     parser = argparse.ArgumentParser(description="龙珠成语 GPU 批量注入")
     parser.add_argument('--batch', type=int, default=16000, help='GPU batch size')
     parser.add_argument('--epochs', type=int, default=3, help='训练轮数')
@@ -140,54 +158,94 @@ def main():
         print("🔍 干运行模式，不修改模型")
         return
     
-    # ── 4. GPU 批量梯度下降 ──
-    print(f"GPU 训练 ({args.epochs} epochs × {total_pairs//args.batch + 1} batches)...")
-    optimizer = torch.optim.Adam(ls.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
-    target = torch.tensor([-15.0], device=device)  # 目标能量：-15
+    # ── 4. GPU 对比学习 ──
+    print(f"GPU 对比训练 ({args.epochs} epochs × {total_pairs//args.batch + 1} batches)...")
+    
+    # 预计算真随机锚点中点（负样本池）
+    n_anchors = len(field.anchors)
+    n_neg = min(total_pairs, 50000)  # 负样本池大小
+    neg_idx_a = torch.randint(0, n_anchors, (n_neg,), device='cpu')
+    neg_idx_b = torch.randint(0, n_anchors, (n_neg,), device='cpu')
+    anchors_gpu = field.anchors.to(device)
+    neg_mids = ((anchors_gpu[neg_idx_a] + anchors_gpu[neg_idx_b]) / 2.0).detach()
+    print(f"   负样本池: {n_neg} 个随机中点")
+    
+    optimizer = torch.optim.Adam(ls.parameters(), lr=args.lr * 0.1)  # 降低学习率
+    margin = 3.0
+    target_low = -20.0
     
     t_train = time.time()
     
     for epoch in range(args.epochs):
-        # 每 epoch 打乱顺序
         perm = torch.randperm(total_pairs, device=device)
         epoch_loss = 0.0
         n_batches = 0
         
         for i in range(0, total_pairs, args.batch):
             batch_idx = perm[i:i + args.batch]
-            batch_mids = all_mids[batch_idx]
+            batch_mids = all_mids[batch_idx]  # 已知字对中点
             
-            energies = ls(batch_mids)
-            loss = criterion(energies, target.expand_as(energies))
+            # 从真随机负样本池采样等量负样本
+            neg_sample_idx = torch.randint(0, n_neg, (len(batch_idx),), device=device)
+            batch_neg = neg_mids[neg_sample_idx]
+            
+            e_known_batch = ls(batch_mids)
+            e_neg_batch = ls(batch_neg)
+            
+            # 对比损失：已知对能量必须低于随机对至少 margin
+            rank_loss = torch.nn.functional.relu(
+                e_known_batch - e_neg_batch + margin
+            ).mean()
+            
+            # 下推损失：已知对能量要低于 target_low
+            push_loss = torch.nn.functional.relu(
+                e_known_batch - target_low
+            ).mean()
+            
+            # 上升损失：随机对能量不能太低（防止整个景观坍塌）
+            anti_collapse = torch.nn.functional.relu(
+                -10.0 - e_neg_batch  # 随机对不能低于 -10
+            ).mean()
+            
+            loss = rank_loss + 0.3 * push_loss + 0.1 * anti_collapse
             
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(ls.parameters(), 0.02)
             optimizer.step()
             
             epoch_loss += loss.item()
             n_batches += 1
         
-        avg_loss = epoch_loss / n_batches
+        avg_loss = epoch_loss / max(n_batches, 1)
         
         # 评估
         with torch.no_grad():
-            e_now = ls(all_mids[indices]).mean().item()
+            e_known_now = ls(all_mids[indices]).mean().item()
+            e_rand_now = ls(neg_mids[:1000]).mean().item()
         
         elapsed = time.time() - t_train
         print(f"   Epoch {epoch+1}/{args.epochs} | loss={avg_loss:.4f} | "
-              f"能量={e_now:+.2f} | {elapsed:.0f}s")
+              f"已知={e_known_now:+.1f} 随机={e_rand_now:+.1f} "
+              f"分离={e_rand_now-e_known_now:.1f} | {elapsed:.0f}s")
     
     train_time = time.time() - t_train
+    
+    # 清理
+    del anchors_gpu, neg_mids
+    torch.cuda.empty_cache()
     
     # ── 5. 注入后评估 ──
     print(f"\n注入后评估...")
     with torch.no_grad():
         e_after = ls(all_mids[indices]).mean().item()
+        random_vecs = torch.randn(1000, 1024, device=device)
+        random_vecs = random_vecs / random_vecs.norm(dim=1, keepdim=True)
+        e_random_after = ls(random_vecs).mean().item()
     
-    print(f"   注入前: {e_before:+.2f}")
-    print(f"   注入后: {e_after:+.2f}")
-    print(f"   降低: {e_before - e_after:.2f}")
+    print(f"   注入前: 已知={e_before:+.2f} 随机={e_random:+.2f} 分离={e_random-e_before:.1f}")
+    print(f"   注入后: 已知={e_after:+.2f} 随机={e_random_after:+.2f} 分离={e_random_after-e_after:.1f}")
+    print(f"   已知对降低: {e_before - e_after:.2f}")
     print(f"   训练耗时: {train_time:.1f}s")
     print(f"   吞吐量: {total_pairs * args.epochs / train_time:.0f} 对/秒")
     
