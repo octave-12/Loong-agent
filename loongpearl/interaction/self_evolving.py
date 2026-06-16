@@ -8,7 +8,7 @@
 架构:
   query("量子纠缠是什么?")
     → 字场编码 → 能量景观推理 → 检索最近锚点
-    → Ollama 用检索结果生成自然语言回答
+    → 能量景观推断生成自然语言回答（零 LLM）
     → (后台) 多源交叉验证 → 极小步长植入 → 反噬检测 → 衰减调度
 """
 
@@ -199,9 +199,14 @@ class SelfEvolvingLoongPearl:
 
     用户只管问, 系统:
       1. 检索关联汉字
-      2. Ollama 生成自然语言回答
+      2. 能量景观推断生成自然语言回答（零 LLM）
       3. 后台静默: 多源交叉验证 → 极小步长学习 → 反噬检测 → 衰减
+    
+    Ollama 已降级为可选后备（默认关闭），设置 use_ollama_fallback = True 可启用。
     """
+
+    # Ollama 后备开关（已弃用，默认关闭）
+    use_ollama_fallback = False
 
     def __init__(self, decay_half_life: float = 72):
         print("🐉 初始化自演化龙珠...")
@@ -278,7 +283,7 @@ class SelfEvolvingLoongPearl:
                     if verbose:
                         print(f"  [反噬] 已回退, 保留原景观")
 
-        # 5. Ollama 用检索结果生成自然语言回答
+        # 5. 能量景观推断生成自然语言回答（零 LLM）
         answer = self._generate_answer(question, chars, energies, search_result)
         if verbose:
             print(f"  [耗时] {time.time()-t0:.1f}s")
@@ -329,18 +334,66 @@ class SelfEvolvingLoongPearl:
     def _generate_answer(self, question: str, chars: list, energies: list,
                          search: dict) -> str:
         """
-        用 Ollama 基于检索结果生成自然语言回答。
-
-        上下文:
-          - 字场检索到的最相关汉字
-          - 联网交叉验证的关键词(如有)
+        从能量景观推断生成自然语言回答（零 LLM 主唱）。
+        
+        使用 self.ls.infer() + self.zc.find_nearest() 获取的最近汉字,
+        结合多源交叉验证结果，拼装成自然回答。
+        
+        Ollama 已降级为可选后备（默认关闭）。
         """
-        # 构建上下文
+        # === Ollama 后备（已弃用）===
+        if self.use_ollama_fallback:
+            import warnings
+            warnings.warn(
+                "Ollama fallback is DEPRECATED. "
+                "Energy landscape inference is now the primary answer generator. "
+                "Set use_ollama_fallback=False to use the new default.",
+                DeprecationWarning, stacklevel=2
+            )
+            return self._generate_answer_ollama(question, chars, energies, search)
+
+        # === 能量景观推断回答 ===
+        lines = []
+
+        # 最近汉字（带相似度分数）
+        # energies 实际是 find_nearest() 返回的余弦相似度 [0, 1]
+        top_items = []
+        for ch, sim in zip(chars[:5], energies[:5]):
+            sim_val = float(sim) if sim is not None else 0.0
+            top_items.append(f"{ch}({sim_val:.2f})")
+
+        if top_items:
+            lines.append(f"「{question}」在字场中关联到: {'、'.join(top_items)}")
+
+        # 联网交叉验证的关键词
+        if search.get('high_conf'):
+            hc_chars = [c for c, _ in search['high_conf'][:5]]
+            lines.append(f"联网验证: {'、'.join(hc_chars)}")
+
+        # 仅低置信度时也展示网络检索结果
+        if search.get('low_conf') and not search.get('high_conf'):
+            lc_chars = [c for c, _ in search['low_conf'][:5]]
+            lines.append(f"网络检索: {'、'.join(lc_chars)}")
+
+        if not lines:
+            related = "、".join(chars[:8])
+            lines.append(f"「{question}」与以下概念关联: {related}")
+
+        return "\n".join(lines)
+
+    def _generate_answer_ollama(self, question: str, chars: list,
+                                 energies: list, search: dict) -> str:
+        """
+        [DEPRECATED] 用 Ollama 基于检索结果生成自然语言回答。
+        
+        此方法仅在 use_ollama_fallback = True 时调用。
+        未来版本将移除。
+        """
         related = "、".join(chars[:8])
         context = f"字场检索关联汉字: [{related}]"
 
         if search.get('high_conf'):
-            hc = "、".join(c for c,_ in search['high_conf'][:5])
+            hc = "、".join(c for c, _ in search['high_conf'][:5])
             context += f"\n联网交叉验证: [{hc}]"
 
         prompt = (
@@ -358,7 +411,6 @@ class SelfEvolvingLoongPearl:
                 "options": {"temperature": 0.5, "num_predict": 500},
             }, timeout=60)
             raw = resp.json().get("response", "")
-            # 去掉 think 块
             raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
             return raw if raw else f"「{question}」在字场中最相关的概念是: {related}"
         except:

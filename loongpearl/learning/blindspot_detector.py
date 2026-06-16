@@ -116,15 +116,22 @@ class PartitionedScanner:
 # ============================================================================
 
 class FactorDetector:
-    """检测因子基类——所有因子继承此接口"""
+    """检测因子基类——所有因子继承此接口
+    
+    当 from_landscape=True 时，因子从能量景观拓扑中直接检测盲区，
+    不依赖 idioms.json。idioms.json 是种子知识/训练引导数据，
+    不是运行时知识源。
+    """
     
     def __init__(self, name: str, field: HanziAnchorField,
-                 landscape: FreqEnergyLandscape, idioms: list,
-                 priority_weight: float = 1.0):
+                 landscape: FreqEnergyLandscape, idioms: list = None,
+                 priority_weight: float = 1.0,
+                 from_landscape: bool = False):
         self.name = name
         self.field = field
         self.landscape = landscape
-        self.idioms = idioms
+        self.idioms = idioms  # None when from_landscape=True (seed only, not runtime)
+        self.from_landscape = from_landscape
         self.priority_weight = priority_weight
         self.device = next(landscape.parameters()).device
         self.ci = field._char_to_idx
@@ -146,6 +153,70 @@ class FactorDetector:
     def chars_to_indices(self, chars: List[str]) -> List[int]:
         """汉字列表 → 索引列表(过滤掉不在字场的)"""
         return [self.ci[c] for c in chars if c in self.ci]
+    
+    def _compute_outgoing_energies(self, chars: List[str],
+                                    sample_targets: int = 200,
+                                    batch_size: int = 200,
+                                    max_chars: int = 5000
+                                    ) -> Dict[str, dict]:
+        """
+        计算每个字符作为源字时的外出能量分布。
+        
+        对每个字符取 sample_targets 个随机目标字，计算中点能量。
+        返回 {char: {'min_energy': float, 'mean_energy': float, 'energies': tensor}}
+        
+        这是 from_landscape 模式的核心方法：所有基于景观的因子共享同一能量计算逻辑。
+        EnergyFactor、StatisticalFactor(from_landscape)、DeadEndFactor(from_landscape)
+        都通过此方法获取能量数据，然后各自按不同标准判定盲区。
+        """
+        result = {}
+        if not chars:
+            return result
+        
+        chars = [c for c in chars if c in self.ci]
+        if max_chars and len(chars) > max_chars:
+            chars = chars[:max_chars]
+        
+        anchors = self.field.anchors.to(self.device)
+        num_anchors = len(anchors)
+        
+        with torch.no_grad():
+            for i in range(0, len(chars), batch_size):
+                batch_chars = chars[i:i + batch_size]
+                src_indices = [self.ci[c] for c in batch_chars]
+                src = anchors[torch.tensor(src_indices, device=self.device)]  # (B, 1024)
+                
+                # 随机采样目标字
+                tgt_indices = torch.randint(0, num_anchors,
+                                           (sample_targets,), device=self.device)
+                tgt = anchors[tgt_indices]  # (S, 1024)
+                
+                B = len(batch_chars)
+                S = sample_targets
+                
+                # 分批前向避免OOM
+                chunk = 500
+                all_energies = []
+                for j in range(0, B * S, chunk):
+                    end = min(j + chunk, B * S)
+                    bi = torch.arange(j, end, device=self.device) // S
+                    si = torch.arange(j, end, device=self.device) % S
+                    mids = (src[bi] + tgt[si]) / 2
+                    e = self.landscape(mids).squeeze(-1)
+                    all_energies.append(e)
+                
+                energies = torch.cat(all_energies).reshape(B, S)
+                min_energies = energies.min(dim=1).values
+                mean_energies = energies.mean(dim=1)
+                
+                for j, ch in enumerate(batch_chars):
+                    result[ch] = {
+                        'min_energy': min_energies[j].item(),
+                        'mean_energy': mean_energies[j].item(),
+                        'energies': energies[j],
+                    }
+        
+        return result
 
 
 # ============================================================================
@@ -157,16 +228,28 @@ class StatisticalFactor(FactorDetector):
     统计盲区: 某字作为尾字经常出现(龙珠常走到它)，
     但作为首字的成语很少(龙珠不知如何从它出发)。
     
-    盲区度 = (尾字频率 - 首字频率) / 总频率
+    from_landscape=False (默认): 使用 idioms.json 建立汉字频率统计，
+      尾字频高但首字频低 → 盲区。idioms.json 在此仅作为训练引导的种子知识。
+    
+    from_landscape=True: 从能量景观拓扑中检测统计盲区。
+      对每个字计算外出能量分布，外出能量偏高(缺乏低能通路) → 盲区。
+      不读取 idioms.json。
+    
+    盲区度 = (尾字频率 - 首字频率) / 总频率   [idioms模式]
+    盲区度 = mean_energy * (1 + |min_energy|)  [landscape模式]
     值越大 → 越需要学习
     """
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('statistical', field, landscape, idioms, priority_weight=1.2)
-        self._build_stats()
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('statistical', field, landscape, idioms, 
+                        priority_weight=1.2, from_landscape=from_landscape)
+        if not from_landscape:
+            if idioms is None:
+                raise ValueError("idioms required when from_landscape=False")
+            self._build_stats()
     
     def _build_stats(self):
-        """建立汉字频率统计"""
+        """建立汉字频率统计 (仅 idioms 模式)"""
         self.head_freq = Counter()
         self.tail_freq = Counter()
         self.total_freq = Counter()
@@ -179,11 +262,17 @@ class StatisticalFactor(FactorDetector):
                 self.total_freq[c] += 1
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
+        if self.from_landscape:
+            return self._scan_from_landscape(partition_range)
+        else:
+            return self._scan_from_idioms(partition_range)
+    
+    def _scan_from_idioms(self, partition_range=None) -> List[BlindSpot]:
+        """传统模式: 基于 idioms.json 的频率统计"""
         t0 = time.time()
         gaps = []
         
         chars_to_scan = list(self.total_freq.keys())
-        # 按频率过滤: 只检测总频率>=3的字(太冷门的不急于学)
         
         for ch in chars_to_scan:
             freq = self.total_freq[ch]
@@ -194,10 +283,9 @@ class StatisticalFactor(FactorDetector):
             
             # 盲区条件: 作为尾字≥2次 且 首字≤2次
             if tail >= 2 and head <= 2:
-                # 盲区度 = 尾频/总频(越高越盲)
                 gap_score = tail / max(freq, 1) * (1 + (tail - head))
                 gaps.append(BlindSpot(
-                    priority=-gap_score,  # 负数用于heap
+                    priority=-gap_score,
                     char=ch,
                     factor=self.name,
                     score=gap_score,
@@ -205,6 +293,45 @@ class StatisticalFactor(FactorDetector):
                         'head_freq': head,
                         'tail_freq': tail,
                         'total_freq': freq,
+                    }
+                ))
+        
+        self._last_scan_time = time.time() - t0
+        return gaps
+    
+    def _scan_from_landscape(self, partition_range=None) -> List[BlindSpot]:
+        """
+        景观模式: 从能量景观拓扑检测统计盲区。
+        
+        原理: 一个字的外出能量偏高 → 龙珠不知道从它出发能去哪 → 盲区。
+        计算每个字作为源字时的外出能量分布，按能量评分排序。
+        不依赖任何外部知识库(idioms.json)，能量景观是唯一知识源。
+        """
+        t0 = time.time()
+        gaps = []
+        
+        # 扫描所有字场中的字(限制数量以控制耗时)
+        all_chars = list(self.ci.keys())
+        energies = self._compute_outgoing_energies(all_chars, max_chars=5000)
+        
+        for ch, edata in energies.items():
+            min_e = edata['min_energy']
+            mean_e = edata['mean_energy']
+            
+            # 景观盲区判定:
+            #   min_energy > -5: 缺乏深盆地连接(无法轻松达到任何目标)
+            #   mean_energy > -2: 平均外出能量偏高(总体连接差)
+            if min_e > -5.0 or mean_e > -2.0:
+                gap_score = mean_e * (1 + abs(min_e))
+                gaps.append(BlindSpot(
+                    priority=-gap_score,
+                    char=ch,
+                    factor=self.name,
+                    score=gap_score,
+                    evidence={
+                        'min_energy': min_e,
+                        'mean_energy': mean_e,
+                        'source': 'energy_landscape_topology',
                     }
                 ))
         
@@ -222,28 +349,40 @@ class EnergyFactor(FactorDetector):
     如果所有目标字的能量都偏高 → 该尾字缺乏低能通路。
     
     使用GPU批量计算，每批处理多个尾字。
+    
+    from_landscape=True 时扫描字场中所有汉字(不限成语中的字)。
     """
     
-    def __init__(self, field, landscape, idioms, sample_targets=200):
-        super().__init__('energy', field, landscape, idioms, priority_weight=0.8)
+    def __init__(self, field, landscape, idioms=None, sample_targets=200,
+                 from_landscape=False):
+        super().__init__('energy', field, landscape, idioms,
+                        priority_weight=0.8, from_landscape=from_landscape)
         self.sample_targets = sample_targets
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
         t0 = time.time()
         
-        # 只扫描在成语词典中出现过的字
-        active_chars = set()
-        for w in self.idioms:
-            if len(w) == 4:
-                active_chars.add(w[-1])  # 尾字
+        if self.from_landscape:
+            # 景观模式: 扫描字场中所有汉字
+            active_chars = [c for c in self.ci.keys()]
+        else:
+            # 传统模式: 只扫描在成语词典中出现过的字
+            active_chars = set()
+            for w in self.idioms:
+                if len(w) == 4:
+                    active_chars.add(w[-1])  # 尾字
+            active_chars = [c for c in active_chars if c in self.ci]
         
-        active_chars = [c for c in active_chars if c in self.ci]
         if partition_range is not None:
             # TODO: 分区过滤
             pass
         
         if not active_chars:
             return []
+        
+        # 限制扫描数量
+        if self.from_landscape and len(active_chars) > 5000:
+            active_chars = active_chars[:5000]
         
         gaps = []
         anchors = self.field.anchors.to(self.device)
@@ -312,12 +451,22 @@ class CoverageFactor(FactorDetector):
     
     如果一个字只作为首字出现、或只作为尾字出现，
     说明龙珠只知道它的一种用法——需要学习其他用法。
+    
+    注: 此因子依赖 idioms.json 统计角色分布，from_landscape 模式下
+    跳过扫描(返回空结果)。覆盖检测本质上是词典统计问题，
+    能量景观本身不编码位置角色信息。
     """
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('coverage', field, landscape, idioms, priority_weight=0.9)
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('coverage', field, landscape, idioms,
+                        priority_weight=0.9, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
+        if self.from_landscape:
+            # 覆盖检测依赖成语词典的角色统计，景观模式跳过
+            self._last_scan_time = 0.0
+            return []
+        
         t0 = time.time()
         
         # 统计每个字的角色分布
@@ -372,16 +521,26 @@ class CoverageFactor(FactorDetector):
 
 class DeadEndFactor(FactorDetector):
     """
-    死路因子: 检查每个成语尾字 → 是否在词典中找到以它开头的成语。
-    找不到 → 硬死路 → 需要学习该字开头的成语。
+    死路因子: 检查每个尾字是否还有后续候选。
+    
+    from_landscape=False (默认): 检查每个成语尾字在 idioms.json 中
+      是否有以它开头的成语。找不到 → 硬死路 → 需要学习该字开头的成语。
+    
+    from_landscape=True: 从能量景观拓扑中检测死路。
+      对每个字计算外出能量分布，如果所有采样目标字的中点能量都高于阈值
+      (无低能通路) → 该字是死路。不读取 idioms.json。
     """
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('dead_end', field, landscape, idioms, priority_weight=1.5)
-        self._build_index()
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('dead_end', field, landscape, idioms,
+                        priority_weight=1.5, from_landscape=from_landscape)
+        if not from_landscape:
+            if idioms is None:
+                raise ValueError("idioms required when from_landscape=False")
+            self._build_index()
     
     def _build_index(self):
-        """构建首字→成语 和 尾字集合"""
+        """构建首字→成语 和 尾字集合 (仅 idioms 模式)"""
         self.head_idx = defaultdict(list)
         self.all_tails = set()
         for w in self.idioms:
@@ -390,10 +549,16 @@ class DeadEndFactor(FactorDetector):
             self.all_tails.add(w[-1])
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
+        if self.from_landscape:
+            return self._scan_from_landscape(partition_range)
+        else:
+            return self._scan_from_idioms(partition_range)
+    
+    def _scan_from_idioms(self, partition_range=None) -> List[BlindSpot]:
+        """传统模式: 基于 idioms.json 的死路检测"""
         t0 = time.time()
         gaps = []
         
-        # 扫描所有尾字
         tail_freq = Counter()
         for w in self.idioms:
             if len(w) == 4:
@@ -432,6 +597,63 @@ class DeadEndFactor(FactorDetector):
         
         self._last_scan_time = time.time() - t0
         return gaps
+    
+    def _scan_from_landscape(self, partition_range=None) -> List[BlindSpot]:
+        """
+        景观模式: 从能量景观拓扑检测死路。
+        
+        原理: 对每个字计算外出能量分布(min_energy, mean_energy),
+        min_energy 高 → 该字无法低能地到达任何目标字 → 死路。
+        
+        死路分类:
+          - 硬死路: min_energy > 0 (完全没有低能通路，所有目标都高能)
+          - 软死路: min_energy > -2 (只有极少高能通路，容易重复)
+        
+        不依赖任何外部知识库(idioms.json)，能量景观是唯一知识源。
+        """
+        t0 = time.time()
+        gaps = []
+        
+        all_chars = list(self.ci.keys())
+        energies = self._compute_outgoing_energies(all_chars, max_chars=5000)
+        
+        for ch, edata in energies.items():
+            min_e = edata['min_energy']
+            mean_e = edata['mean_energy']
+            
+            # 硬死路: min_energy > 0 → 所有采样目标都高能，无低能通路
+            if min_e > 0.0:
+                gap_score = (min_e + 5.0) * 3.0
+                gaps.append(BlindSpot(
+                    priority=-gap_score,
+                    char=ch,
+                    factor=self.name,
+                    score=gap_score,
+                    evidence={
+                        'min_energy': min_e,
+                        'mean_energy': mean_e,
+                        'is_hard_dead_end': True,
+                        'source': 'energy_landscape_topology',
+                    }
+                ))
+            # 软死路: -2 <= min_energy <= 0 → 只有少数高能通路
+            elif min_e > -2.0:
+                gap_score = (min_e + 2.0) * 1.5 + mean_e
+                gaps.append(BlindSpot(
+                    priority=-gap_score,
+                    char=ch,
+                    factor=self.name,
+                    score=gap_score,
+                    evidence={
+                        'min_energy': min_e,
+                        'mean_energy': mean_e,
+                        'is_soft_dead_end': True,
+                        'source': 'energy_landscape_topology',
+                    }
+                ))
+        
+        self._last_scan_time = time.time() - t0
+        return gaps
 
 
 # ============================================================================
@@ -446,8 +668,9 @@ class GradientFactor(FactorDetector):
     梯度显著偏离 → 该锚点区域的景观结构异常 → 需要更多学习来稳定。
     """
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('gradient', field, landscape, idioms, priority_weight=0.6)
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('gradient', field, landscape, idioms,
+                        priority_weight=0.6, from_landscape=from_landscape)
         self.calibrated = False
         self.grad_mean = 0.0
         self.grad_std = 1.0
@@ -525,8 +748,9 @@ class SemanticGapFactor(FactorDetector):
     龙珠应该学习跨簇的关联。
     """
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('semantic', field, landscape, idioms, priority_weight=0.5)
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('semantic', field, landscape, idioms,
+                        priority_weight=0.5, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
         # 简化版: 检测高频字之间的连接强度
@@ -596,8 +820,9 @@ class FreshnessFactor(FactorDetector):
         '的一是在不了有和人这中大为上个国我以要他时来用们生到作地于出就分对成会可主发年动同工也能下过子说产种面而方后多定行学法所民得经十三之进着等部度家电力里如水化高自二理起小物现实加量都两体制机当使点从业本去把性好应开它合还因由其些然前外天政四日那社义事平形相全表间样与关各重新线内数正心反你明看原又么利比或但质气第向道命此变条只没结解问意建月公无系军很情最何总通干光门社'
     )
     
-    def __init__(self, field, landscape, idioms):
-        super().__init__('freshness', field, landscape, idioms, priority_weight=0.7)
+    def __init__(self, field, landscape, idioms=None, from_landscape=False):
+        super().__init__('freshness', field, landscape, idioms,
+                        priority_weight=0.7, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
         t0 = time.time()
@@ -659,8 +884,21 @@ class MultiFactorDetector:
     """
     多因子盲区检测器 —— 7个因子并行/串行扫描，结果合并去重。
     
+    两种工作模式:
+      from_landscape=False (默认/传统): 使用 idioms.json 进行检测。
+        idioms.json 是"种子知识/训练引导数据"，不是运行时知识源。
+        它的角色是提供初始的汉字使用统计，帮助检测器快速收敛。
+        
+      from_landscape=True (纯景观): 所有检测从能量景观拓扑出发。
+        不使用 idioms.json。能量景观是唯一知识源。
+        DeadEndFactor 和 StatisticalFactor 直接分析外出能量分布判定盲区。
+    
     使用方式:
+        # 传统模式(需要idioms)
         detector = MultiFactorDetector(field, landscape, idioms)
+        
+        # 纯景观模式(不需要idioms)
+        detector = MultiFactorDetector(field, landscape, from_landscape=True)
         
         # 全因子全分区扫描
         results = detector.scan_all()
@@ -674,22 +912,43 @@ class MultiFactorDetector:
     
     def __init__(self, field: HanziAnchorField,
                  landscape: FreqEnergyLandscape,
-                 idioms: list,
-                 num_partitions: int = 8):
+                 idioms: list = None,
+                 num_partitions: int = 8,
+                 from_landscape: bool = False):
+        """
+        Args:
+            field: 汉字锚点场
+            landscape: 频率能量景观
+            idioms: 成语列表(种子知识/训练引导数据，非运行时知识源)。
+                    from_landscape=True 时为可选。
+            num_partitions: 分区数
+            from_landscape: True=纯景观模式(不读idioms.json),
+                           False=传统模式(使用idioms统计)
+        """
+        if not from_landscape and idioms is None:
+            raise ValueError(
+                "idioms is required when from_landscape=False. "
+                "idioms.json serves as seed knowledge / training bootstrap, "
+                "not a runtime knowledge source. "
+                "Use from_landscape=True for pure landscape topology detection."
+            )
+        
         self.field = field
         self.landscape = landscape
-        self.idioms = idioms
+        self.idioms = idioms  # seed knowledge only, not runtime source
         self.num_partitions = num_partitions
+        self.from_landscape = from_landscape
         
         # 初始化7个因子
+        # 每个因子通过 from_landscape 标志决定使用 idioms 统计还是景观拓扑
         self.factors = [
-            StatisticalFactor(field, landscape, idioms),
-            EnergyFactor(field, landscape, idioms),
-            CoverageFactor(field, landscape, idioms),
-            DeadEndFactor(field, landscape, idioms),
-            GradientFactor(field, landscape, idioms),
-            SemanticGapFactor(field, landscape, idioms),
-            FreshnessFactor(field, landscape, idioms),
+            StatisticalFactor(field, landscape, idioms, from_landscape=from_landscape),
+            EnergyFactor(field, landscape, idioms, from_landscape=from_landscape),
+            CoverageFactor(field, landscape, idioms, from_landscape=from_landscape),
+            DeadEndFactor(field, landscape, idioms, from_landscape=from_landscape),
+            GradientFactor(field, landscape, idioms, from_landscape=from_landscape),
+            SemanticGapFactor(field, landscape, idioms, from_landscape=from_landscape),
+            FreshnessFactor(field, landscape, idioms, from_landscape=from_landscape),
         ]
         
         # 结果管理
@@ -858,9 +1117,16 @@ class MultiFactorDetector:
 # 便捷函数
 # ============================================================================
 
-def create_detector(field, landscape, idioms, **kwargs) -> MultiFactorDetector:
-    """快速创建多因子检测器"""
-    return MultiFactorDetector(field, landscape, idioms, **kwargs)
+def create_detector(field, landscape, idioms=None, from_landscape=False, **kwargs) -> MultiFactorDetector:
+    """快速创建多因子检测器
+    
+    Args:
+        field: 汉字锚点场
+        landscape: 频率能量景观
+        idioms: 成语列表(种子知识/训练引导数据)。from_landscape=True 时可选。
+        from_landscape: True=纯景观模式
+    """
+    return MultiFactorDetector(field, landscape, idioms, from_landscape=from_landscape, **kwargs)
 
 
 # ============================================================================
@@ -877,6 +1143,9 @@ if __name__ == '__main__':
     
     PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
+    # 是否使用纯景观模式(不加载idioms)
+    use_landscape = '--landscape' in sys.argv
+    
     print("\n加载模型...")
     field = HanziAnchorField.load(
         os.path.join(PROJECT, 'data/models/zichang_94117_1024d.pt'),
@@ -886,16 +1155,22 @@ if __name__ == '__main__':
         os.path.join(PROJECT, 'data/models/energy_landscape_1024d.pt')
     ).eval()
     
-    with open(os.path.join(PROJECT, 'data/dicts/idioms.json'), encoding='utf-8') as f:
-        idioms = json.load(f)
-    
-    print(f"字场:{field.num_hanzi} 成语:{len(idioms)}")
+    idioms = None
+    if not use_landscape:
+        # idioms.json = 种子知识/训练引导数据，非运行时知识源
+        with open(os.path.join(PROJECT, 'data/dicts/idioms.json'), encoding='utf-8') as f:
+            idioms = json.load(f)
+        print(f"字场:{field.num_hanzi} 成语(种子):{len(idioms)}")
+    else:
+        print(f"字场:{field.num_hanzi} 模式:纯景观(无idioms)")
     
     # 创建检测器
-    detector = MultiFactorDetector(field, landscape, idioms, num_partitions=4)
+    detector = MultiFactorDetector(field, landscape, idioms,
+                                   num_partitions=4,
+                                   from_landscape=use_landscape)
     
     # 全因子扫描
-    print("\n🔍 全因子扫描...")
+    print(f"\n🔍 全因子扫描 (from_landscape={use_landscape})...")
     results = detector.scan_all(parallel=False)
     
     # 展示结果

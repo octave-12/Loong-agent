@@ -139,6 +139,11 @@ class LoongPearl:
         self.total_queries = 0
         self.total_known = 0
         self.total_learned = 0
+        
+        # 课程（婴儿式成长）
+        self._curriculum = None
+        self.curriculum_advance_interval = 100  # 每N次成功查询后尝试推进课程
+        self._curriculum_advance_counter = 0
     
     # ------------------------------------------------------------------
     # 计算沙盒（懒加载）
@@ -150,6 +155,14 @@ class LoongPearl:
         if self._sandbox is None:
             self._sandbox = ComputeSandbox(timeout=10)
         return self._sandbox
+    
+    @property
+    def curriculum(self):
+        """婴儿课程懒加载 —— 首次访问时加载 BabyCurriculum"""
+        if self._curriculum is None:
+            from loongpearl.learning.curriculum import BabyCurriculum
+            self._curriculum = BabyCurriculum()
+        return self._curriculum
     
     # ------------------------------------------------------------------
     # 初始化
@@ -351,6 +364,10 @@ class LoongPearl:
         # 步骤4: 已知 → 能量景观推理
         self.total_known += 1
         
+        # 课程推进检测：每N次成功查询后尝试推进课程阶段
+        self._curriculum_advance_counter += 1
+        self._try_advance_curriculum()
+        
         infer_result = self.landscape.infer(
             query_vec,
             steps=infer_steps,
@@ -375,6 +392,13 @@ class LoongPearl:
         except Exception:
             pass  # 强化失败不影响主流程
         
+        # 废退：每N次查询后触发一次衰减（清理久未使用的知识）
+        if self.total_queries % 50 == 0:
+            try:
+                self.learner.decay_step()
+            except Exception:
+                pass
+        
         # 格式化答案
         answer_text = self._format_answer(nearest_chars, similarities, infer_result)
         
@@ -397,20 +421,19 @@ class LoongPearl:
     
     def learn_from_ollama(self, text: str, max_retries: int = 2) -> bool:
         """
-        调用 Ollama (DeepSeek-R1) 学习新概念，将知识注入能量景观。
+        [DEPRECATED] 调用 Ollama 学习新概念。
         
-        流程:
-          1. 构建提示词，让模型提取核心关键词（单汉字）
-          2. 解析返回的 JSON
-          3. 对每个关联字 → Hebbian 学习降低路径能量
+        自主搜索学习 (AutonomousLearner.learn_if_unknown) 已取代此方法。
+        此方法仅作为后备——当联网搜索不可用且 Ollama 在线时才调用。
         
-        Args:
-            text: 要学习的概念
-            max_retries: 最大重试次数
-        
-        Returns:
-            是否成功学习到新知识
+        计划在 v3 中移除。
         """
+        import warnings
+        warnings.warn(
+            "learn_from_ollama() is deprecated. "
+            "AutonomousLearner.learn_if_unknown() is the preferred learning path.",
+            DeprecationWarning, stacklevel=2
+        )
         for attempt in range(max_retries):
             try:
                 # 调用 Ollama
@@ -631,6 +654,39 @@ class LoongPearl:
         self.landscape.save(path or self.landscape_path)
     
     # ------------------------------------------------------------------
+    # 课程推进
+    # ------------------------------------------------------------------
+    
+    def _try_advance_curriculum(self):
+        """每N次成功查询后尝试推进课程阶段（不抛异常，不影响主流程）"""
+        if self._curriculum_advance_counter < self.curriculum_advance_interval:
+            return
+        
+        self._curriculum_advance_counter = 0
+        
+        try:
+            curriculum = self.curriculum
+            old_stage = curriculum.current_stage
+            advanced = curriculum.advance_if_ready()
+            
+            if advanced:
+                new_stage = curriculum.current_stage
+                stage_name = curriculum.STAGES.get(new_stage, f'阶段{new_stage}')
+                print(f"\n🐣 课程进阶！阶段 {old_stage} → {new_stage} ({stage_name})")
+                curriculum.save_progress()
+            elif old_stage <= 4:
+                # 阶段1-4 未达标则继续学习当前阶段内容
+                try:
+                    curriculum.learn_next_batch(10)
+                    curriculum.save_progress()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            # 课程推进失败不影响主查询流程
+            pass
+    
+    # ------------------------------------------------------------------
     # 统计
     # ------------------------------------------------------------------
     
@@ -650,6 +706,20 @@ class LoongPearl:
         
         if self.learner:
             stats['learner'] = self.learner.get_stats()
+        
+        # 课程信息
+        if self._curriculum is not None:
+            curriculum = self._curriculum
+            stats['curriculum'] = {
+                'stage': curriculum.current_stage,
+                'stage_name': curriculum.STAGES.get(curriculum.current_stage, '未知'),
+                'known_chars': len(curriculum.known_chars),
+                'known_words': len(curriculum.known_words),
+                'mastered_chars': len(curriculum.mastered_chars),
+                'char_index': curriculum.char_index,
+                'advance_interval': self.curriculum_advance_interval,
+                'counter': self._curriculum_advance_counter,
+            }
         
         return stats
     

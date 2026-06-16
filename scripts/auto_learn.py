@@ -13,11 +13,20 @@
 不依赖 Hermes 喂数据，不依赖 Ollama。
 龙珠自己发现「我不知道什么」，自己去学。
 
+检测模式:
+  from_landscape=True (默认): 纯景观模式。
+    能量景观是唯一知识源。idioms.json 仅作为训练引导的种子知识，
+    不是运行时知识源。
+  from_landscape=False (--use-idioms): 传统模式。
+    使用 idioms.json 统计信息辅助检测。
+
 用法:
-    python scripts/auto_learn.py              # 扫描+学习一轮
-    python scripts/auto_learn.py --daemon     # 7×24守护进程
+    python scripts/auto_learn.py              # 扫描+学习一轮(纯景观)
+    python scripts/auto_learn.py --daemon     # 7×24守护进程(纯景观)
+    python scripts/auto_learn.py --use-idioms # 传统模式(使用idioms)
     python scripts/auto_learn.py --scan-only  # 只扫描不学习
     python scripts/auto_learn.py --daemon --interval 300  # 每5分钟一轮
+    python scripts/auto_learn.py --daemon --stage 2       # 从阶段2开始
 """
 
 import sys, os, json, time, argparse, signal, logging, threading
@@ -34,6 +43,7 @@ from loongpearl.learning.autonomous_learner import AutonomousLearner
 from loongpearl.learning.blindspot_detector import (
     MultiFactorDetector, BlindSpot, ScanResult
 )
+from loongpearl.learning.curriculum import BabyCurriculum
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -70,13 +80,21 @@ class AutoLearningDaemon:
         5. 标记已学习 → 更新队列
         6. 保存能量景观
         7. 休眠 interval 秒 → 下一轮
+    
+    检测模式:
+      from_landscape=True (默认): 纯景观模式，所有检测从能量景观拓扑出发。
+        能量景观是唯一知识源。idioms.json 仅作为种子知识/训练引导。
+      from_landscape=False: 传统模式，使用 idioms.json 统计信息辅助检测。
     """
     
     def __init__(self, scan_interval: int = 120, max_learn_per_round: int = 3,
-                 factors: list = None):
+                 factors: list = None, from_landscape: bool = True,
+                 start_stage: int = 0):
         self.scan_interval = scan_interval
         self.max_learn_per_round = max_learn_per_round
         self.active_factors = factors  # None = 全部
+        self.from_landscape = from_landscape
+        self.start_stage = start_stage  # 0 = 从保存的进度恢复
         
         # 状态
         self.running = True
@@ -88,9 +106,11 @@ class AutoLearningDaemon:
         self._load_models()
         
         # 创建多因子检测器
+        # idioms 作为种子知识/训练引导传入，非运行时知识源
         self.detector = MultiFactorDetector(
             self.field, self.landscape, self.idioms,
-            num_partitions=8
+            num_partitions=8,
+            from_landscape=from_landscape,
         )
         
         # 创建自主学习引擎
@@ -102,13 +122,26 @@ class AutoLearningDaemon:
         self.learn_log_path = LOG_DIR / 'learned_blindspots.json'
         self._load_learn_log()
         
+        # 课程（婴儿式成长）
+        self.curriculum = BabyCurriculum()
+        if self.start_stage > 0 and self.start_stage <= 8:
+            self.curriculum.current_stage = self.start_stage
+        
         log.info(f"🐉 龙珠 7×24 自主学习守护进程就绪")
-        log.info(f"   字场:{self.field.num_hanzi} 成语:{len(self.idioms)}")
+        log.info(f"   字场:{self.field.num_hanzi} 成语(种子):{len(self.idioms) if self.idioms else 0}")
+        log.info(f"   模式:{'纯景观' if from_landscape else '传统(idioms)'}")
         log.info(f"   因子:{len(self.detector.factors)} 分区:{self.detector.num_partitions}")
         log.info(f"   间隔:{scan_interval}s 每轮学习:{max_learn_per_round}个")
+        log.info(f"   课程: 阶段{self.curriculum.current_stage} ({self.curriculum.STAGES[self.curriculum.current_stage]}) "
+                 f"已识{len(self.curriculum.known_chars)}字")
     
     def _load_models(self):
-        """加载所有模型"""
+        """加载所有模型
+        
+        idioms.json = 种子知识/训练引导数据，非运行时知识源。
+        在 from_landscape=True 模式下仍然加载它供课程系统使用，
+        但检测器不依赖它进行盲区检测。
+        """
         log.info("加载字场...")
         self.field = HanziAnchorField.load(
             os.path.join(PROJECT, 'data/models/zichang_94117_1024d.pt'),
@@ -127,8 +160,14 @@ class AutoLearningDaemon:
         except Exception as e:
             log.warning(f"校准跳过: {e}")
         
-        with open(os.path.join(PROJECT, 'data/dicts/idioms.json'), encoding='utf-8') as f:
-            self.idioms = json.load(f)
+        # idioms.json: 种子知识/训练引导，非运行时知识源
+        # 纯景观模式下仍加载供课程系统参考，但检测器不使用
+        idioms_path = os.path.join(PROJECT, 'data/dicts/idioms.json')
+        if os.path.exists(idioms_path):
+            with open(idioms_path, encoding='utf-8') as f:
+                self.idioms = json.load(f)
+        else:
+            self.idioms = None
     
     def _load_learn_log(self):
         """加载已学习记录"""
@@ -262,10 +301,35 @@ class AutoLearningDaemon:
             if i < self.max_learn_per_round - 1:
                 time.sleep(2)
         
-        # 3. 保存
+        # 3. 衰减(废退) — 每轮对久未使用的知识施加衰减
+        try:
+            decay_result = self.learner.decay_step()
+            if decay_result.get('decayed', 0) > 0:
+                log.info(f"  📉 衰减: {decay_result.get('decayed',0)} 条弱化")
+        except Exception:
+            pass
+        
+        # 4. 保存
         save_path = os.path.join(PROJECT, 'data/models/energy_landscape_1024d.pt')
         self.landscape.save(save_path)
         self._save_learn_log()
+        
+        # 5. 课程推进（每轮尝试，不抛异常不影响主流程）
+        try:
+            old_stage = self.curriculum.current_stage
+            advanced = self.curriculum.advance_if_ready()
+            if advanced:
+                log.info(f"🐣 课程进阶！阶段 {old_stage} → {self.curriculum.current_stage} "
+                         f"({self.curriculum.STAGES[self.curriculum.current_stage]})")
+                self.curriculum.save_progress()
+            elif self.curriculum.current_stage <= 4:
+                try:
+                    self.curriculum.learn_next_batch(10)
+                    self.curriculum.save_progress()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         
         stats = self.detector.get_stats()
         log.info(f"\n  📊 本轮: 学{learned_this_round}个 | "
@@ -309,6 +373,18 @@ class AutoLearningDaemon:
         log.info(f"   总学习: {self.total_learned}")
         log.info(f"   注入对: {self.total_injected_pairs}")
         log.info(f"   {self.detector.get_stats()}")
+        
+        # 课程统计
+        try:
+            c = self.curriculum
+            log.info(f"\n🐣 课程进度:")
+            log.info(f"   阶段: {c.current_stage} ({c.STAGES.get(c.current_stage, '未知')})")
+            log.info(f"   已识单字: {len(c.known_chars)}")
+            log.info(f"   已学词语: {len(c.known_words)}")
+            log.info(f"   掌握单字: {len(c.mastered_chars)}")
+            c.save_progress()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -321,11 +397,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python auto_learn.py                    # 一轮扫描+学习
+  python auto_learn.py                    # 一轮扫描+学习(纯景观模式)
+  python auto_learn.py --use-idioms       # 传统模式(使用idioms统计)
   python auto_learn.py --scan-only        # 只看盲区不学习
   python auto_learn.py --daemon           # 7×24守护进程
   python auto_learn.py --daemon -i 300    # 每5分钟一轮
   python auto_learn.py --daemon -n 10     # 只跑10轮
+  python auto_learn.py --daemon --stage 2 # 从阶段2(组合字)开始
   python auto_learn.py -f statistical,dead_end  # 只用指定因子
         """
     )
@@ -341,6 +419,10 @@ def main():
                        help='每轮最多学习几个盲区, 默认3')
     parser.add_argument('--factors', '-f', type=str, default=None,
                        help='指定因子(逗号分隔), 默认全部')
+    parser.add_argument('--stage', type=int, default=0,
+                       help='起始课程阶段(1-8), 0=从保存进度恢复, 默认0')
+    parser.add_argument('--use-idioms', action='store_true',
+                       help='使用 idioms.json 统计信息辅助检测(默认: 纯景观模式)')
     args = parser.parse_args()
     
     # 解析因子
@@ -348,11 +430,17 @@ def main():
     if args.factors:
         factors = [f.strip() for f in args.factors.split(',')]
     
+    # 检测模式: 默认 from_landscape=True (纯景观)
+    # idioms.json 是种子知识/训练引导，不是运行时知识源
+    from_landscape = not args.use_idioms
+    
     # 创建守护进程
     daemon = AutoLearningDaemon(
         scan_interval=args.interval,
         max_learn_per_round=args.max_learn,
         factors=factors,
+        from_landscape=from_landscape,
+        start_stage=args.stage,
     )
     
     if args.scan_only:
