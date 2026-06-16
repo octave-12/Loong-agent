@@ -44,3 +44,9 @@ Thumbs.db
 # ── 缓存 ──
 .dict_cache/
 .vis_cache/
+data/models/concept_graph.json
+data/models/concept_graph_embeds.pt
+data/models/energy_pyramid.pt
+data/models/energy_pyramid_deep.pt
+data/models/energy_landscape_1024d.pt
+data/models/*.pt.backup
