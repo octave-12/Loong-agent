@@ -41,6 +41,7 @@ from loongpearl.core.zichang import HanziAnchorField
 from loongpearl.core.energy_landscape import EnergyLandscape
 from loongpearl.learning.learner import DragonBallLearner, HebbianLearner
 from loongpearl.data_config import DATA_ROOT, MODEL_DIR, DICT_DIR, RUNTIME_DIR
+from loongpearl.utils.compute_sandbox import ComputeSandbox
 
 
 # ============================================================================
@@ -128,6 +129,7 @@ class LoongPearl:
         self.landscape: Optional[EnergyLandscape] = None
         self.learner: Optional[DragonBallLearner] = None
         self.embed_model: Optional[SentenceTransformer] = None
+        self._sandbox: Optional[ComputeSandbox] = None
         
         self.initialized = False
         
@@ -135,6 +137,17 @@ class LoongPearl:
         self.total_queries = 0
         self.total_known = 0
         self.total_learned = 0
+    
+    # ------------------------------------------------------------------
+    # 计算沙盒（懒加载）
+    # ------------------------------------------------------------------
+    
+    @property
+    def sandbox(self) -> ComputeSandbox:
+        """计算沙盒懒加载 —— 首次访问时创建"""
+        if self._sandbox is None:
+            self._sandbox = ComputeSandbox(timeout=10)
+        return self._sandbox
     
     # ------------------------------------------------------------------
     # 初始化
@@ -253,6 +266,17 @@ class LoongPearl:
         
         # 步骤1: 编码查询
         query_vec = self._encode(question)
+        
+        # 步骤1.5: 计算沙盒检测 —— 数学类问题直接计算，不经过能量景观
+        if self.sandbox.is_math_question(question):
+            answer = self.sandbox.calculate(question)
+            return QueryResult(
+                question=question,
+                is_known=True,
+                confidence=1.0,
+                answer_text=answer,
+                diagnosis="计算沙盒",
+            )
         
         # 步骤2: 自知无知检测
         check_result = self.learner.check_knowledge(query_vec)
