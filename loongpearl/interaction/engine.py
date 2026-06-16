@@ -38,8 +38,9 @@ from sentence_transformers import SentenceTransformer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from loongpearl.core.zichang import HanziAnchorField
-from loongpearl.core.energy_landscape import EnergyLandscape
+from loongpearl.core.freq_landscape import FreqEnergyLandscape
 from loongpearl.learning.learner import DragonBallLearner, HebbianLearner
+from loongpearl.learning.autonomous_learner import AutonomousLearner
 from loongpearl.data_config import DATA_ROOT, MODEL_DIR, DICT_DIR, RUNTIME_DIR
 from loongpearl.utils.compute_sandbox import ComputeSandbox
 
@@ -126,8 +127,9 @@ class LoongPearl:
         
         # 核心组件（initialize() 中加载）
         self.zichang: Optional[HanziAnchorField] = None
-        self.landscape: Optional[EnergyLandscape] = None
+        self.landscape: Optional[FreqEnergyLandscape] = None
         self.learner: Optional[DragonBallLearner] = None
+        self.autonomous_learner: Optional[AutonomousLearner] = None
         self.embed_model: Optional[SentenceTransformer] = None
         self._sandbox: Optional[ComputeSandbox] = None
         
@@ -178,7 +180,7 @@ class LoongPearl:
         
         # 2. 加载能量景观
         printer("[2/4] 加载能量景观...")
-        self.landscape = EnergyLandscape.load(self.landscape_path)
+        self.landscape = FreqEnergyLandscape.load(self.landscape_path)
         self.landscape.eval()
         self.landscape.to(self.device)
         printer(f"      能量景观: 已加载 (dim={self.landscape.embed_dim})")
@@ -198,6 +200,14 @@ class LoongPearl:
             printer(f"      学习器: 已校准")
         except Exception as e:
             printer(f"      学习器: 校准跳过 ({e})")
+        
+        # 3.5 创建自主学习引擎
+        self.autonomous_learner = AutonomousLearner(
+            zichang=self.zichang,
+            landscape=self.landscape,
+            learner=self.learner,
+        )
+        printer(f"      自主学习引擎: 就绪")
         
         # 4. 加载编码模型
         printer("[4/4] 加载编码模型...")
@@ -286,17 +296,36 @@ class LoongPearl:
         if verbose:
             print(f"  自知无知: {check_result['diagnosis']} (conf={confidence:.2%})")
         
-        # 步骤3a: 未知 → 学习
+        # 步骤3a: 未知 → 自主学习（不依赖 Ollama）
         if not is_known and auto_learn:
             if verbose:
-                print(f"  触发学习: '{question}' → Ollama...")
+                print(f"  触发自主学习: '{question}' → 联网搜索...")
             
-            learned = self.learn_from_ollama(question)
+            # 优先走自主搜索学习（零 LLM）
+            learn_result = self.autonomous_learner.learn_if_unknown(
+                query_text=question,
+                query_vec=query_vec,
+                auto_search=True,
+            )
             
-            if learned:
+            if learn_result['status'] == 'learned':
                 self.total_learned += 1
-                # 学习后重新查询（不再次触发学习）
+                # 保存更新后的能量景观
+                try:
+                    self.save_landscape()
+                except Exception:
+                    pass
+                # 学习后重新查询
                 return self.query(question, auto_learn=False, infer_steps=infer_steps, verbose=verbose)
+            
+            # 自主搜索失败 → 回退 Ollama（如果可用）
+            if learn_result['status'] == 'search_failed':
+                if verbose:
+                    print(f"  联网搜索未找到知识，回退 Ollama...")
+                learned = self.learn_from_ollama(question)
+                if learned:
+                    self.total_learned += 1
+                    return self.query(question, auto_learn=False, infer_steps=infer_steps, verbose=verbose)
             else:
                 # 学习失败，返回"不知道"
                 return QueryResult(

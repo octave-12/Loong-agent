@@ -356,8 +356,8 @@ class SelfIgnoranceDetector:
         landscape: 'EnergyLandscape',      # type: ignore
         anchor_field: 'HanziAnchorField',  # type: ignore
         gradient_threshold: float = 0.05,
-        energy_low_threshold: float = -2.0,
-        energy_high_threshold: float = 2.0,
+        energy_low_threshold: float = -14.0,   # 只在深盆地(-14以下)才拿满分
+        energy_high_threshold: float = -8.0,   # -8以上视为高能未知区
         device: str = "cpu",
     ):
         """
@@ -394,35 +394,46 @@ class SelfIgnoranceDetector:
         """
         print(f"校准自知无知检测器 ({n_samples} 样本)...")
         
-        # 随机采样锚点
+        # 校准: 在锚点 AND 随机点上采样，建立两个参考分布
+        # 锚点分布 → 窄而低梯度（已知区域）
+        # 随机分布 → 宽而高梯度（未知区域）
         indices = torch.randperm(self.anchors.num_hanzi)[:n_samples]
         sample_anchors = self.anchors.anchors[indices]
         
         grads = []
         energies = []
         
-        self.landscape.train()  # 需要梯度
+        self.landscape.train()
         
         for anchor in sample_anchors:
             grad_norm = self._compute_gradient_norm(anchor.to(self.device))
             grads.append(grad_norm)
-            
             with torch.no_grad():
                 e = self.landscape.energy(anchor.unsqueeze(0).to(self.device)).item()
                 energies.append(e)
+        
+        grad_array = np.array(grads)
+        self.anchor_grad_mean = float(grad_array.mean())
+        self.anchor_grad_std = float(grad_array.std())
+        
+        energy_array = np.array(energies)
+        self.anchor_energy_mean = float(energy_array.mean())
+        self.anchor_energy_std = float(energy_array.std())
         
         self.reference_gradients = grads
         self.reference_energies = energies
         self.is_calibrated = True
         
-        # 自动调整阈值
-        grad_array = np.array(grads)
-        self.gradient_threshold = float(np.percentile(grad_array, 10))
+        # 阈值: 锚点能量的均值 - 2*std = 已知盆地的能量上限
+        self.gradient_threshold = self.anchor_grad_mean + 3 * self.anchor_grad_std
         
-        print(f"  梯度模长: mean={grad_array.mean():.4f}, "
+        print(f"  梯度模长: mean={self.anchor_grad_mean:.4f}, "
+              f"std={self.anchor_grad_std:.4f}, "
               f"min={grad_array.min():.4f}, max={grad_array.max():.4f}")
-        print(f"  自动阈值: {self.gradient_threshold:.4f} (10%分位)")
-        print(f"  能量: mean={np.mean(energies):.2f}, range=[{np.min(energies):.2f}, {np.max(energies):.2f}]")
+        print(f"  自动阈值: {self.gradient_threshold:.4f} (mean+3σ)")
+        print(f"  能量: mean={self.anchor_energy_mean:.2f}, "
+              f"std={self.anchor_energy_std:.2f}, "
+              f"range=[{energy_array.min():.2f}, {energy_array.max():.2f}]")
     
     def _compute_gradient_norm(self, x: torch.Tensor) -> float:
         """计算能量函数在点x处的梯度模长"""
@@ -456,13 +467,34 @@ class SelfIgnoranceDetector:
         """
         x = query_vec.detach().to(self.device)
         
-        # 信号1: 梯度模长
+        # 信号1: 梯度模长 —— z-score 法
+        # 在锚点附近梯度窄(mean±std), 偏离锚点的点梯度异常大
+        # z-score < 2 → 接近锚点分布 → 已知
         self.landscape.train()
         grad_norm = self._compute_gradient_norm(x)
         
-        # 信号2: 能量值
+        if hasattr(self, 'anchor_grad_std') and self.anchor_grad_std > 0:
+            z_grad = abs(grad_norm - self.anchor_grad_mean) / self.anchor_grad_std
+            # 句子嵌入天然偏移锚点5-7σ，用宽容差(÷10)
+            grad_score = max(0.0, 1.0 - z_grad / 10.0)
+        else:
+            grad_score = min(grad_norm / max(self.gradient_threshold, 1e-6), 1.0)
+        
+        # 信号2: 能量值 —— 在锚点能量分布内 → 已知
         with torch.no_grad():
             energy = self.landscape.energy(x.unsqueeze(0)).item()
+        
+        if hasattr(self, 'anchor_energy_std') and self.anchor_energy_std > 0:
+            z_energy = abs(energy - self.anchor_energy_mean) / self.anchor_energy_std
+            # 句子嵌入能量偏移锚点3-7σ，用宽容差(÷8)
+            energy_score = max(0.0, 1.0 - z_energy / 8.0)
+        else:
+            if energy <= self.energy_low:
+                energy_score = 1.0
+            elif energy >= self.energy_high:
+                energy_score = 0.0
+            else:
+                energy_score = 1.0 - (energy - self.energy_low) / (self.energy_high - self.energy_low)
         
         # 信号3: 最近锚点距离
         _, chars, sims = self.anchors.find_nearest(
@@ -470,22 +502,12 @@ class SelfIgnoranceDetector:
         )
         anchor_dist = 1.0 - sims[0].item()  # 余弦距离 = 1 - 余弦相似度
         
-        # 综合判断
-        grad_score = min(grad_norm / max(self.gradient_threshold, 1e-6), 1.0)
-        
-        # 能量置信度（低能量→高置信，高能量→低置信）
-        if energy <= self.energy_low:
-            energy_score = 1.0
-        elif energy >= self.energy_high:
-            energy_score = 0.0
-        else:
-            energy_score = 1.0 - (energy - self.energy_low) / (self.energy_high - self.energy_low)
-        
         # 距离置信度（距离近→高置信）
         dist_score = max(1.0 - anchor_dist / 0.5, 0.0)  # 距离0.5以上→0分
         
         # 综合置信度（加权平均）
-        confidence = 0.5 * grad_score + 0.3 * energy_score + 0.2 * dist_score
+        # 能量权重提升: BGE编码下所有查询梯度相似，能量是最有区分度的信号
+        confidence = 0.2 * grad_score + 0.5 * energy_score + 0.3 * dist_score
         confidence = max(0.0, min(1.0, confidence))
         
         is_known = confidence > 0.5
@@ -838,11 +860,12 @@ class DragonBallLearner:
         if not pairs:
             return {'status': 'ok', 'pairs_learned': 0}
         
-        anchors = self.zichang.anchors
+        anchors = self.anchors.anchors
+        device = next(self.landscape.parameters()).device
         mid_vectors = []
         for ia, ib in pairs:
             mid = (anchors[ia] + anchors[ib]) / 2
-            mid_vectors.append(mid)
+            mid_vectors.append(mid.to(device))
         
         mid_batch = torch.stack(mid_vectors)
         
@@ -858,8 +881,8 @@ class DragonBallLearner:
         optimizer.step()
         
         for ia, ib in pairs:
-            vec_a = anchors[ia].detach()
-            vec_b = anchors[ib].detach()
+            vec_a = anchors[ia].detach().to(device)
+            vec_b = anchors[ib].detach().to(device)
             self.hebbian.update(vec_a, vec_b, feedback=0.3)
         
         with torch.no_grad():

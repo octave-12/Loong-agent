@@ -85,11 +85,11 @@ class WebSearcher:
     # 搜索引擎配置 (按优先级)
     ENGINES = [
         {
-            'name': 'bing',
+            'name': 'baidu',
             'domain': 'zh',
-            'url': 'https://www.bing.com/search',
-            'params': lambda q: {'q': q, 'cc': 'cn', 'setlang': 'zh-Hans'},
-            'result_pattern': r'<li[^>]*class="b_algo"[^>]*>.*?<h2[^>]*>.*?<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?<p[^>]*class="b_lineclamp[^"]*"[^>]*>(.*?)</p>',
+            'url': 'https://www.baidu.com/s',
+            'params': lambda q: {'wd': q, 'rn': '10'},
+            'result_pattern': None,
         },
         {
             'name': 'duckduckgo',
@@ -251,7 +251,9 @@ class WebSearcher:
         """查询单个搜索引擎"""
         name = engine['name']
         
-        if name == 'duckduckgo':
+        if name == 'baidu':
+            return self._search_baidu(query, limit)
+        elif name == 'duckduckgo':
             return self._search_ddg(query, limit)
         elif name == 'bing':
             return self._search_bing(query, limit)
@@ -261,6 +263,54 @@ class WebSearcher:
             return self._search_baike_as_results(query, limit)
         
         return []
+    
+    def _search_baidu(self, query: str, limit: int) -> List[SearchResult]:
+        """百度搜索 (HTML解析)"""
+        try:
+            r = self.session.get(
+                'https://www.baidu.com/s',
+                params={'wd': query, 'rn': limit},
+                timeout=self.timeout,
+            )
+            if r.status_code != 200:
+                return []
+            
+            html = r.text
+            results = []
+            
+            # 百度结果格式: <div class="result c-container"> ... <h3><a>标题</a></h3> ... <span class="content-right_...">摘要</span>
+            blocks = re.findall(
+                r'<div[^>]*class="[^"]*result[^"]*c-container[^"]*"[^>]*>(.*?)</div>\s*</div>\s*</div>',
+                html, re.DOTALL
+            )
+            
+            for block in blocks[:limit]:
+                # 提取标题和链接
+                m = re.search(r'<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+                if not m:
+                    continue
+                url = m.group(1)
+                title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                
+                # 提取摘要
+                snippet = ''
+                m2 = re.search(r'<span[^>]*class="[^"]*content-right[^"]*"[^>]*>(.*?)</span>', block, re.DOTALL)
+                if m2:
+                    snippet = re.sub(r'<[^>]+>', '', m2.group(1)).strip()[:300]
+                if not snippet:
+                    # 备选: 取所有文本
+                    text = re.sub(r'<[^>]+>', ' ', block)
+                    text = re.sub(r'\s+', ' ', text).strip()
+                    snippet = text[:300]
+                
+                results.append(SearchResult(
+                    title=title, url=url, snippet=snippet,
+                    source='baidu', relevance=0.7,
+                ))
+            
+            return results
+        except Exception:
+            return []
     
     def _search_ddg(self, query: str, limit: int) -> List[SearchResult]:
         """DuckDuckGo HTML 搜索"""
@@ -438,13 +488,11 @@ class WebSearcher:
     def _select_engines(self, domain: str) -> List[dict]:
         """根据知识域选择搜索引擎"""
         if domain == 'idiom':
-            # 成语: 百度百科 → 维基 → DuckDuckGo
-            return [e for e in self.ENGINES if e['name'] in ('baidu_baike', 'wikipedia_zh', 'duckduckgo')]
+            return [e for e in self.ENGINES if e['name'] in ('baidu', 'baidu_baike', 'wikipedia_zh', 'duckduckgo')]
         elif domain == 'character':
-            return [e for e in self.ENGINES if e['name'] in ('baidu_baike', 'wikipedia_zh', 'duckduckgo')]
+            return [e for e in self.ENGINES if e['name'] in ('baidu', 'baidu_baike', 'wikipedia_zh', 'duckduckgo')]
         else:
-            # 通用: Bing → 维基 → DuckDuckGo
-            return [e for e in self.ENGINES if e['name'] in ('bing', 'wikipedia_zh', 'duckduckgo')]
+            return [e for e in self.ENGINES if e['name'] in ('baidu', 'wikipedia_zh', 'duckduckgo')]
     
     def _synthesize_answer(self, query: str, results: List[SearchResult], domain: str) -> str:
         """从搜索结果综合回答"""
