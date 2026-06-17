@@ -456,9 +456,12 @@ def run_daemon(field, landscape, learner, args):
             tick = orch.daemon_tick(round_num)
 
             # 日志输出本轮引擎活动
-            if tick.get('harvest', {}).get('collected', 0) > 0:
-                log.info(f"  🌾 万象收: +{tick['harvest']['collected']}三元组 "
-                        f"(源: {tick['harvest'].get('titles', [])[:2]})")
+            if tick.get('pipeline', {}).get('acquired', 0) > 0:
+                p = tick['pipeline']
+                log.info(f"  📖 知识管线: 需求{p['demands_found']} "
+                        f"采集{p['acquired']} "
+                        f"注入{p['triples_added']}三元组 "
+                        f"{p.get('total_bigrams',0)}字对")
 
             if tick.get('contra', {}).get('detected', 0) > 0:
                 c = tick['contra']

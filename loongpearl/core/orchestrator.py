@@ -61,6 +61,7 @@ class Orchestrator:
         self._contra = None
         self._conversation = None
         self._creative = None
+        self._pipeline = None
 
         self._init_time = time.time()
         self._round_stats = {
@@ -145,6 +146,19 @@ class Orchestrator:
             self._creative = CreativeEngine(self.field, self.cg, self.decoder)
         return self._creative
 
+    @property
+    def pipeline(self):
+        if self._pipeline is None:
+            from loongpearl.core.knowledge_pipeline import KnowledgePipeline
+            self._pipeline = KnowledgePipeline(
+                field=self.field,
+                landscape=self.landscape,
+                concept_graph=self.cg,
+                orchestrator=self,
+                learner=getattr(self, 'learner', None),
+            )
+        return self._pipeline
+
     # ═══════════════════════════════════════════════════════════════════
     # 对话全链路 (chat模式)
     # ═══════════════════════════════════════════════════════════════════
@@ -190,6 +204,11 @@ class Orchestrator:
 
         # ── 路由3: 知识查询 (原有全栈) ──
         result["type"] = "knowledge"
+
+        # 🔑 用户查询中的概念 → 自动汇入知识获取管线
+        for concept in frame.concepts[:5]:
+            if concept and len(concept) >= 2:
+                self.pipeline.feed_user_concept(concept, context=query)
 
         # 语言检测 → 跨语言路由
         lang = self.multilang.detect_language(query)
@@ -325,19 +344,26 @@ class Orchestrator:
 
     def daemon_tick(self, round_num: int) -> Dict[str, Any]:
         """
-        守护循环的一轮调度。由 auto_learn 的 run_round 之后调用。
+        守护循环的一轮调度。
 
+        核心变更: 用 KnowledgePipeline 替代旧的分散采集。
+        
         调度表:
-          每轮(1,2,3,4,6,7,8,9...): Harvester Wikipedia采集 + SemParser理解
-          每5轮:    ContraResolver 检测消解 + FuzzyGraph 回写CG
-          每10轮:   TaskPlanner 学习目标规划
-          每20轮:   MultiFormKG 跨格式验证
+          每轮:    pipeline.tick() — 检测需求+多源采集+精炼注入
+          每5轮:   ContraResolver + FuzzyGraph D-S回写
+          每10轮:  TaskPlanner 学习目标规划
+          每20轮:  MultiFormKG 跨格式验证
         """
         tick_report = {}
 
-        # ── 每轮: 万象收 Wikipedia 真采集 ──
+        # ── 每轮: 知识获取管线 (检测→采集→精炼→注入) ──
         if round_num % 2 == 0:
-            tick_report['harvest'] = self._harvest_from_wikipedia()
+            try:
+                pipe_result = self.pipeline.tick(max_demands=5, max_acquire=3)
+                if pipe_result['acquired'] > 0:
+                    tick_report['pipeline'] = pipe_result
+            except Exception as e:
+                log.debug(f"  管线异常: {e}")
 
         # ── 每5轮: 矛盾检测消解 + 模糊格闭环 ──
         if round_num % 5 == 0:
