@@ -274,13 +274,14 @@ class SemParser:
         """从概念图提取已有概念，扩充 jieba 词表和领域术语"""
         if not self.cg or not hasattr(self.cg, 'triples'):
             return
-        for s in list(self.cg.triples.keys())[:50000]:  # 取前5万避免过慢
+        for s in list(self.cg.triples.keys())[:5000]:
             if len(s) >= 2:
                 self.domain_terms.add(s)
                 jieba.add_word(s, freq=100)
         # 也添加客体
-        for triples_list in list(self.cg.triples.values())[:50000]:
-            for (rel, o, conf, src) in triples_list:
+        for key, triple in list(self.cg.triples.items())[:5000]:
+            if hasattr(triple, 'object'):
+                o = triple.object
                 if len(o) >= 2:
                     self.domain_terms.add(o)
 
@@ -505,20 +506,25 @@ class SemParser:
         resolved = []
         unknown = []
 
+        # 构建subject索引加速查找
+        subjects = set()
+        for key, triple in list(self.cg.triples.items())[:5000]:
+            if hasattr(triple, 'subject'):
+                subjects.add(triple.subject)
+                subjects.add(triple.object)
+
         for concept in concepts:
-            # 精确匹配
-            if concept in self.cg.triples:
+            if concept in subjects:
                 resolved.append(concept)
             else:
-                # 尝试模糊匹配 (包含关系)
-                alternatives = self._fuzzy_match_concept(concept)
+                # 模糊匹配
+                alternatives = [s for s in subjects if concept in s or s in concept]
                 if alternatives:
-                    # 取匹配度最高的
-                    best = max(alternatives, key=lambda x: len(x))
+                    best = max(alternatives, key=len)
                     resolved.append(best)
                 else:
                     unknown.append(concept)
-                    resolved.append(concept)  # 保留原词，即使不在图里
+                    resolved.append(concept)
 
         return resolved, unknown
 

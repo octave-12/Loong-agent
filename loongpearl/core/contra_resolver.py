@@ -159,6 +159,14 @@ class ContraResolver:
     # 检测器 1: 环路检测
     # ═════════════════════════════════════════════════════════════════════
 
+    def _get_triples_for(self, subject: str) -> List[Tuple[str, str, float, str]]:
+        """适配概念图 Triple 格式: 返回 (relation, object, conf, source) 列表"""
+        results = []
+        for key, t in list(self.cg.triples.items())[:50000]:
+            if hasattr(t, 'subject') and t.subject == subject:
+                results.append((t.relation, t.object, t.confidence, t.source))
+        return results
+
     def detect_cycles(self) -> List[Conflict]:
         """检测 IS_A 和 PART_OF 环路"""
         conflicts = []
@@ -198,7 +206,7 @@ class ContraResolver:
         visited.add(current)
 
         if current in self.cg.triples:
-            for rel, obj, conf, src in self.cg.triples[current]:
+            for rel, obj, conf, src in self._get_triples_for(current):
                 if rel == rel_type:
                     if obj == target:
                         return [current, obj]
@@ -222,7 +230,7 @@ class ContraResolver:
                 continue
 
             relations_to_obj = defaultdict(set)
-            for rel, obj, conf, src in self.cg.triples[s]:
+            for rel, obj, conf, src in self._get_triples_for(s):
                 relations_to_obj[obj].add(rel)
 
             for obj, rels in relations_to_obj.items():
@@ -252,7 +260,7 @@ class ContraResolver:
                 continue
 
             has_values = defaultdict(list)
-            for rel, obj, conf, src in self.cg.triples[s]:
+            for rel, obj, conf, src in self._get_triples_for(s):
                 if rel == 'HAS' and obj in self.cg.triples:
                     has_values[obj].append((conf, src))
 
@@ -287,7 +295,7 @@ class ContraResolver:
                 continue
 
             relations_to_obj = defaultdict(set)
-            for rel, obj, conf, src in self.cg.triples[s]:
+            for rel, obj, conf, src in self._get_triples_for(s):
                 relations_to_obj[obj].add(rel)
 
             for obj, rels in relations_to_obj.items():
@@ -383,7 +391,7 @@ class ContraResolver:
         if not self.cg or s not in self.cg.triples:
             return []
         sources = []
-        for rel, obj, conf, src in self.cg.triples[s]:
+        for rel, obj, conf, src in self._get_triples_for(s):
             if rel == r and obj == o:
                 sources.append(src)
         return sources

@@ -163,6 +163,15 @@ class Orchestrator:
     # 对话全链路 (chat模式)
     # ═══════════════════════════════════════════════════════════════════
 
+
+    def _get_triples_for(self, subject: str):
+        """适配概念图 Triple 格式: 返回 (relation, object, conf, source) 列表"""
+        results = []
+        for key, t in list(self.cg.triples.items())[:50000]:
+            if hasattr(t, 'subject') and t.subject == subject:
+                results.append((t.relation, t.object, t.confidence, t.source))
+        return results
+
     def dialogue(self, query: str) -> Dict[str, Any]:
         """
         全栈对话 — 四层路由:
@@ -205,27 +214,26 @@ class Orchestrator:
         # ── 路由3: 知识查询 (原有全栈) ──
         result["type"] = "knowledge"
 
-        # 🔑 用户查询中的概念 → 自动汇入知识获取管线
-        for concept in frame.concepts[:5]:
-            if concept and len(concept) >= 2:
-                self.pipeline.feed_user_concept(concept, context=query)
-
         # 语言检测 → 跨语言路由
         lang = self.multilang.detect_language(query)
         result['debug']['lang'] = lang
 
         if lang != 'zh':
-            # 英文查询 → 映射到中文概念
             cids = self.multilang.map_to_concepts(query, lang=lang)
             if cids:
                 zh_name = self.multilang.get_concept_name(cids[0], 'zh')
                 if zh_name:
                     result['debug']['cross_lang'] = f"{query} → {zh_name}"
                     self._round_stats['cross_lang_lookups'] += 1
-                    query = zh_name  # 替换为中文概念名继续处理
+                    query = zh_name
 
         # Step 1: NLU — 解义器
         frame = self.sem_parser.parse(query)
+
+        # 🔑 用户查询中的新概念 → 自动汇入知识管线
+        for concept in frame.concepts[:5]:
+            if concept and len(concept) >= 2:
+                self.pipeline.feed_user_concept(concept, context=query)
         result['debug']['frame'] = {
             'type': frame.question_type.name if frame.question_type else '陈述',
             'intent': frame.intent.name if frame.intent else 'N/A',
@@ -260,7 +268,7 @@ class Orchestrator:
         if frame.intent and frame.intent.name in ('CHECK_TRUTH', 'FIND_PATH', 'DEFINE'):
             for concept in frame.concepts[:3]:
                 if concept in self.cg.triples:
-                    for rel, obj, conf, src in self.cg.triples[concept][:5]:
+                    for rel, obj, conf, src in self._get_triples_for(concept)[:5]:
                         self.fuzzy.add_evidence(concept, rel, obj, 
                                                 source=src, mass=conf)
 
@@ -327,12 +335,12 @@ class Orchestrator:
             if bpa.combined_mass > 0:
                 # 更新概念图中的置信度
                 if s in self.cg.triples:
-                    for i, (rel, obj, conf, src) in enumerate(self.cg.triples[s]):
+                    for i, (rel, obj, conf, src) in enumerate(self._get_triples_for(s)):
                         if rel == r and obj == o:
                             # 用 D-S 融合后的置信度替换原始置信度
                             new_triple = (rel, obj, bpa.combined_mass, 
                                          f"{src}+DS")
-                            self.cg.triples[s][i] = new_triple
+                            self._get_triples_for(s)[i] = new_triple
                             count += 1
         if count:
             self._round_stats['d_s_feedbacks'] += count
@@ -386,7 +394,7 @@ class Orchestrator:
         # 从概念图中选高频、高置信度的节点作为采集目标
         candidates = []
         for s in list(self.cg.triples.keys())[:200]:
-            deg = len(self.cg.triples.get(s, []))
+            deg = len(self._get_triples_for(s))
             if deg >= 3:  # 度≥3的节点才有足够上下文
                 candidates.append(s)
 
@@ -440,7 +448,7 @@ class Orchestrator:
             for s, r, o, conf in c.involved_triples:
                 evidence_count = 0
                 if s in self.cg.triples:
-                    evidence_count = sum(1 for rel, obj, _, _ in self.cg.triples[s]
+                    evidence_count = sum(1 for rel, obj, _, _ in self._get_triples_for(s)
                                         if rel == r and obj == o)
                 # 置信度 > 0.7 且 证据数 > 1 → 不purge，标记争议
                 if conf > 0.7 and evidence_count > 1:
@@ -470,7 +478,7 @@ class Orchestrator:
         # 对低置信度三元组添加证据
         added = 0
         for s in list(self.cg.triples.keys())[:1000]:
-            for rel, obj, conf, src in self.cg.triples.get(s, []):
+            for rel, obj, conf, src in self._get_triples_for(s):
                 if 0.2 < conf < 0.7:  # 中等置信度才值得重评估
                     self.fuzzy.add_evidence(s, rel, obj, source=src, mass=conf)
                     added += 1
@@ -495,7 +503,7 @@ class Orchestrator:
         # 找连接稀疏但度高的节点（枢纽但冷门）
         low_degree_nodes = []
         for s in list(self.cg.triples.keys())[:5000]:
-            deg = len(self.cg.triples.get(s, []))
+            deg = len(self._get_triples_for(s))
             if deg >= 5 and deg <= 20:
                 low_degree_nodes.append(s)
 
