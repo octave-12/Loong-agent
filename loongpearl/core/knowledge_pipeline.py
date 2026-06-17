@@ -326,35 +326,81 @@ class KnowledgePipeline:
         return result
 
     def _acquire_from_local_dicts(self, demand: KnowledgeDemand) -> AcquisitionResult:
-        """从本地词典(IDIOM/UNIHAN/CEDICT/唐诗)采集"""
-        result = AcquisitionResult(source="local_dict", query=demand.target)
+        """
+        从本地知识源采集。优先查概念图（已消化），回退文件。
+
+        消化完成后概念图已包含全部本地知识，文件只作备份。
+        """
+        result = AcquisitionResult(source="local", query=demand.target)
 
         target = demand.target
-        # 如果是单个汉字
+
+        # 单字: 查概念图中的成语 COOCCURS_IN + Unihan HAS_PINYIN
         if len(target) == 1 and '\u4e00' <= target <= '\u9fff':
-            # 查成语
-            idiom_result = self._lookup_idioms_for_char(target)
-            if idiom_result:
-                result = self._merge_results(result, idiom_result)
+            result = self._merge_results(result, self._cg_lookup_idioms(target))
+            result = self._merge_results(result, self._cg_lookup_unihan(target))
 
-            # 查Unihan
-            unihan_result = self._lookup_unihan(target)
-            if unihan_result:
-                result = self._merge_results(result, unihan_result)
-
-        # 如果是多字概念
+        # 多字: 查概念图中的 DEFINED_AS + COOCCURS_WITH
         if len(target) >= 2:
-            # 查CEDICT
-            cedict_result = self._lookup_cedict(target)
-            if cedict_result:
-                result = self._merge_results(result, cedict_result)
-
-            # 查唐诗字对
+            result = self._merge_results(result, self._cg_lookup_term(target))
+            # 字对: POETIC_WITH
             if len(target) == 2:
-                tang_result = self._lookup_tang_bigram(target)
-                if tang_result:
-                    result = self._merge_results(result, tang_result)
+                result = self._merge_results(result, self._cg_lookup_tang(target))
 
+        return result
+
+    def _cg_lookup_idioms(self, char: str) -> AcquisitionResult:
+        """从概念图查包含某字的成语 (已消化自 idioms.json)"""
+        result = AcquisitionResult(source="cg:idioms", query=char)
+        if not self.cg:
+            return result
+        for key, t in list(self.cg.triples.items())[:200000]:
+            if getattr(t, 'relation', '') == 'COOCCURS_IN' and t.subject == char:
+                idiom = t.object
+                if len(idiom) == 4:
+                    result.new_concepts.append(idiom)
+                    for i in range(len(idiom)-1):
+                        a, b = idiom[i], idiom[i+1]
+                        if '\u4e00' <= a <= '\u9fff' and '\u4e00' <= b <= '\u9fff':
+                            result.bigrams[(a,b)] = result.bigrams.get((a,b), 0) + 1
+                            result.triples.append((a, "COOCCURS_WITH", b, 0.7))
+                if len(result.new_concepts) >= 20:
+                    break
+        return result
+
+    def _cg_lookup_unihan(self, char: str) -> AcquisitionResult:
+        """从概念图查汉字属性 (已消化自 Unihan)"""
+        result = AcquisitionResult(source="cg:unihan", query=char)
+        if not self.cg:
+            return result
+        for key, t in list(self.cg.triples.items())[:100000]:
+            if t.subject == char and t.relation in ('HAS_PINYIN', 'DEFINED_AS', 'HAS'):
+                result.triples.append((char, t.relation, t.object, t.confidence))
+        return result
+
+    def _cg_lookup_term(self, term: str) -> AcquisitionResult:
+        """从概念图查词条定义+共现 (已消化自 CEDICT)"""
+        result = AcquisitionResult(source="cg:cedict", query=term)
+        if not self.cg:
+            return result
+        for key, t in list(self.cg.triples.items())[:200000]:
+            if t.subject == term and t.relation in ('DEFINED_AS', 'HAS_PINYIN', 'IS_A'):
+                result.triples.append((term, t.relation, t.object, t.confidence))
+            # 字间共现
+            if t.relation == 'COOCCURS_WITH' and term[0] == t.subject and len(term) >= 2 and term[1] == t.object:
+                result.bigrams[(t.subject, t.object)] = result.bigrams.get((t.subject, t.object), 0) + 1
+        return result
+
+    def _cg_lookup_tang(self, pair: str) -> AcquisitionResult:
+        """从概念图查唐诗字对 (已消化自 tang_poetry_ngrams)"""
+        result = AcquisitionResult(source="cg:tang", query=pair)
+        if not self.cg or len(pair) != 2:
+            return result
+        for key, t in list(self.cg.triples.items())[:100000]:
+            if t.relation == 'POETIC_WITH' and t.subject == pair[0] and t.object == pair[1]:
+                result.triples.append((pair[0], "POETIC_WITH", pair[1], t.confidence))
+                result.bigrams[(pair[0], pair[1])] = int(t.confidence * 20)
+                break
         return result
 
     def _acquire_from_web(self, demand: KnowledgeDemand) -> AcquisitionResult:
