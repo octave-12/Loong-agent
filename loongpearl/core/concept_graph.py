@@ -1552,20 +1552,24 @@ class ConceptGraph:
     # 持久化
     # ═══════════════════════════════════════════════════════════════════════
 
-    def save(self, path: str):
+    def save(self, path: str, save_embeds: bool = False):
         """
         保存概念图。
 
-        生成两个文件:
+        生成:
           path.json       — 图结构（含置信度/来源等元数据）
-          path_embeds.pt  — 节点嵌入向量（torch 格式）
+          path_embeds.pt  — 节点嵌入向量（默认不保存, 可重算, 1.9GB）
+
+        Args:
+            save_embeds: 是否保存嵌入。默认False——嵌入在内存中从字场现场计算更快。
         """
         base = path.replace('.json', '').replace('.pt', '')
         os.makedirs(os.path.dirname(base) if os.path.dirname(base) else '.', exist_ok=True)
 
-        # 保存嵌入向量
-        embeds = {k: v for k, v in self.nodes.items()}
-        torch.save(embeds, base + '_embeds.pt')
+        # 嵌入向量 (默认跳过——可从字场重算)
+        if save_embeds:
+            embeds = {k: v for k, v in self.nodes.items()}
+            torch.save(embeds, base + '_embeds.pt')
 
         # 保存图结构
         triples_data = []
@@ -1590,7 +1594,7 @@ class ConceptGraph:
             json.dump(graph_data, f, ensure_ascii=False, indent=2)
 
         self._data_dir = os.path.dirname(base)
-        print(f"概念图已保存: {base}.json + {base}_embeds.pt")
+        print(f"概念图已保存: {base}.json" + (" + {base}_embeds.pt" if save_embeds else ""))
 
     def load(self, path: str):
         """
