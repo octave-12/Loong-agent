@@ -205,19 +205,20 @@ class KnowledgePipeline:
             return demands
 
         candidates = []
-        for s, triples_list in list(self.cg.triples.items())[:20000]:
-            for rel, obj, conf, src in triples_list:
-                if 0.2 < conf < 0.5:
-                    candidates.append((s, rel, obj, conf))
+        for key, triple in list(self.cg.triples.items())[:30000]:
+            # triple 是 Triple 对象: subject, relation, object, confidence
+            conf = getattr(triple, 'confidence', getattr(triple, 'c', 0.5))
+            if 0.2 < conf < 0.5:
+                candidates.append((triple.subject, triple.relation, triple.object, conf))
 
         candidates.sort(key=lambda x: x[3])
-        for s, rel, obj, conf in candidates[:n]:
-            target = f"{s} {rel} {obj}"
+        for s, r, o, conf in candidates[:n]:
+            target = f"{s} {r} {o}"
             if target not in self._processed_demands:
                 demands.append(KnowledgeDemand(
                     type=DemandType.LOW_CONFIDENCE,
                     target=target,
-                    context={"subject": s, "relation": rel, "object": obj,
+                    context={"subject": s, "relation": r, "object": o,
                             "confidence": conf},
                     priority=0.6,
                 ))
@@ -230,19 +231,20 @@ class KnowledgePipeline:
         if not self.cg:
             return demands
 
-        candidates = []
-        for s, triples_list in list(self.cg.triples.items())[:10000]:
-            deg = len(triples_list)
-            if 1 <= deg <= 3 and len(s) >= 3:
-                candidates.append((s, deg))
+        # 统计每个subject的出现次数
+        deg = defaultdict(int)
+        for key, triple in list(self.cg.triples.items())[:50000]:
+            deg[triple.subject] += 1
 
+        candidates = [(s, d) for s, d in deg.items() 
+                     if 1 <= d <= 3 and len(s) >= 3]
         candidates.sort(key=lambda x: x[1])
-        for s, deg in candidates[:n]:
+        for s, d in candidates[:n]:
             if s not in self._processed_demands:
                 demands.append(KnowledgeDemand(
                     type=DemandType.SPARSE_NODE,
                     target=s,
-                    context={"degree": deg},
+                    context={"degree": d},
                     priority=0.5,
                 ))
 
@@ -572,17 +574,25 @@ class KnowledgePipeline:
         if self.cg:
             for s, r, o, conf in result.triples:
                 if self._is_valid_triple(s, r, o):
-                    self.cg.add_triple(s, r, o, confidence=conf, source=result.source)
-                    total_added += 1
+                    try:
+                        self.cg.add_triple(s, r, o, confidence=conf, source=result.source)
+                        total_added += 1
+                    except Exception:
+                        pass
 
             # 添加新概念节点
             for concept in result.new_concepts:
-                if concept not in self.cg.triples and len(concept) >= 2:
-                    self.cg.add_triple(
-                        concept, "RELATED", result.query[:20],
-                        confidence=0.3, source=result.source
-                    )
-                    total_added += 1
+                if len(concept) >= 2:
+                    key = f"{concept}|RELATED|{result.query[:20]}"
+                    if key not in self.cg.triples:
+                        try:
+                            self.cg.add_triple(
+                                concept, "RELATED", result.query[:20],
+                                confidence=0.3, source=result.source
+                            )
+                            total_added += 1
+                        except Exception:
+                            pass
 
         self.stats['total_triples_added'] += total_added
 
