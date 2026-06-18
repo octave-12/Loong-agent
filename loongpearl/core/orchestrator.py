@@ -299,7 +299,14 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_triples_for(self, subject: str):
-        """适配概念图 Triple 格式: 返回 (relation, object, conf, source) 列表 (索引查找版)"""
+        """返回 (relation, object, conf, source) 列表 (SQLite优先, JSON回退)"""
+        # ★ SQLite 加速: O(log N) 索引查询
+        if hasattr(self, '_cgdb') and self._cgdb is not None:
+            try:
+                return self._cgdb.query_by_subject(subject, limit=200)
+            except Exception:
+                pass
+        # JSON 回退
         results = []
         count = 0
         for key, t in self.cg.triples.items():
@@ -497,24 +504,29 @@ class Orchestrator:
 
     def _route_sequential(self, text: str, query_chars: list,
                           query_vec: torch.Tensor) -> Dict:
-        """序列类查询: 概念图 POETIC_NEXT 优先"""
+        """序列类查询: 概念图 POETIC_NEXT 优先 (SQLite 加速)"""
         result = {'path': 'poetic_next', 'result': None, 'fallback': False}
 
-        # 取最后一个汉字作为锚点
         last_char = query_chars[-1] if query_chars else ''
         if not last_char:
             result['fallback'] = True
             return result
 
-        # 查概念图 POETIC_NEXT: 锚点的下一个字
+        # ★ SQLite 直接查询 POETIC_NEXT
         next_chars = []
-        triples = self._get_triples_for(last_char)
-        for rel, obj, conf, src in triples:
-            if rel == 'POETIC_NEXT' and conf > 0.01 and len(obj) == 1:
-                next_chars.append((obj, conf))
+        if hasattr(self, '_cgdb') and self._cgdb is not None:
+            try:
+                next_chars = self._cgdb.query_poetic_next(last_char, min_conf=0.01)
+            except Exception:
+                pass
 
-        # 按置信度排序
-        next_chars.sort(key=lambda x: -x[1])
+        # 回退: JSON _get_triples_for
+        if not next_chars:
+            triples = self._get_triples_for(last_char)
+            for rel, obj, conf, src in triples:
+                if rel == 'POETIC_NEXT' and conf > 0.01 and len(obj) == 1:
+                    next_chars.append((obj, conf))
+            next_chars.sort(key=lambda x: -x[1])
 
         if next_chars:
             result['result'] = {
@@ -524,7 +536,6 @@ class Orchestrator:
             }
             return result
 
-        # 概念图无 POETIC_NEXT → 回退到能量景观梯度下降
         result['path'] = 'energy_landscape'
         result['fallback'] = True
         return result
@@ -1975,7 +1986,21 @@ def create_orchestrator(field, landscape, learner=None) -> Orchestrator:
 
 
 def create_orchestrator_with_sequential(field, landscape, learner=None) -> Orchestrator:
-    """创建调度器并加载序列臂有向字对"""
+    """创建调度器并加载序列臂有向字对 + SQLite 查询加速"""
     orch = create_orchestrator(field, landscape, learner)
     orch._load_directed_pairs()
+
+    # ★ SQLite 查询加速层
+    try:
+        from loongpearl.core.concept_graph_sqlite import ConceptGraphSQLite
+        _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        db_path = os.path.join(_project_root, 'data', 'models', 'concept_graph.db')
+        orch._cgdb = ConceptGraphSQLite(db_path)
+        orch._cgdb.create_tables()
+        n = orch._cgdb.count_triples()
+        log.info(f"  SQLite加速: {n}条三元组索引就绪")
+    except Exception as e:
+        log.warning(f"  SQLite加速初始化失败: {e}")
+        orch._cgdb = None
+
     return orch
