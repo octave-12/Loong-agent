@@ -20,6 +20,7 @@ import os
 import time
 import re
 import logging
+import threading
 from typing import Dict, List, Optional, Any, Tuple
 
 import torch
@@ -71,6 +72,7 @@ class Orchestrator:
             'data', 'runtime', 'pending_queries.json'
         )
         self._pending_queries: List[Dict] = []  # [{query_text, signal, ts, attempts, top_candidate}]
+        self._pending_lock = threading.Lock()    # ★ 并发安全锁
         self._load_pending_queries()
 
         self._init_time = time.time()
@@ -108,23 +110,24 @@ class Orchestrator:
     def _add_pending_query(self, query_text: str, signal: str, top_candidate: str = ''):
         """
         ★ 将一个超出知识范围的查询加入优先学习队列。
-        去重: 同一查询文本不重复入队。
+        去重: 同一查询文本不重复入队。线程安全。
         """
-        for pq in self._pending_queries:
-            if pq.get('query_text') == query_text:
-                pq['ts'] = time.time()
-                pq['signal'] = signal
-                pq['attempts'] = pq.get('attempts', 0)
-                self._save_pending_queries()
-                return
-        self._pending_queries.append({
-            'query_text': query_text,
-            'signal': signal,
-            'ts': time.time(),
-            'attempts': 0,
-            'top_candidate': top_candidate,
-        })
-        self._save_pending_queries()
+        with self._pending_lock:
+            for pq in self._pending_queries:
+                if pq.get('query_text') == query_text:
+                    pq['ts'] = time.time()
+                    pq['signal'] = signal
+                    pq['attempts'] = pq.get('attempts', 0)
+                    self._save_pending_queries()
+                    return
+            self._pending_queries.append({
+                'query_text': query_text,
+                'signal': signal,
+                'ts': time.time(),
+                'attempts': 0,
+                'top_candidate': top_candidate,
+            })
+            self._save_pending_queries()
         log.info(f"📌 待决入队: '{query_text[:40]}' (信号={signal})")
 
     def _resolve_pending_query(self, query_text: str):
@@ -1467,6 +1470,12 @@ class Orchestrator:
                     log.info(f"  🧠 吸收: {tick_report['pairs_injected']}字对 "
                             f"分离度 {tick_report.get('separation_before',0):.1f}→"
                             f"{tick_report.get('separation_after',0):.1f}")
+                    # ★ EWC 正则: 拉回锚定参数
+                    if hasattr(self.learner, 'ewc_regularize'):
+                        try:
+                            self.learner.ewc_regularize()
+                        except Exception:
+                            pass
             except Exception as e:
                 log.warning(f"  双臂搜索/注入异常: {e}")
 
@@ -1532,6 +1541,15 @@ class Orchestrator:
                     tick_report['pyramid'] = p_result
             except Exception as e:
                 log.debug(f"  金字塔异常: {e}")
+
+        # 每50轮: EWC Fisher更新 + 锚定参数采样
+        if round_num % 50 == 0 and self.learner and hasattr(self.learner, 'update_ewc_fisher'):
+            try:
+                fisher_result = self.learner.update_ewc_fisher(n_samples=200)
+                log.info(f"  ⚓ EWC锚定: {fisher_result['params_anchored']}参数 "
+                        f"Fisher质量={fisher_result['total_fisher_mass']:.1f}")
+            except Exception as e:
+                log.warning(f"  EWC Fisher更新失败: {e}")
 
         return tick_report
 
@@ -1777,6 +1795,12 @@ class Orchestrator:
             if pairs and self.learner:
                 self.learner.learn_pairs_batch(pairs, learning_rate=0.01)
                 log.info(f"  🎯 知识对齐: {len(pairs)}对概念映射到能量景观")
+                # ★ EWC 正则
+                if hasattr(self.learner, 'ewc_regularize'):
+                    try:
+                        self.learner.ewc_regularize()
+                    except Exception:
+                        pass
         except Exception:
             pass
 

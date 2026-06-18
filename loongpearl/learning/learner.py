@@ -795,6 +795,13 @@ class DragonBallLearner:
         self.total_learns = 0
         self.total_decays = 0
         self.total_checks = 0
+
+        # ── EWC 弹性权重巩固 ──
+        self._ewc_ref_params: Dict[str, torch.Tensor] = {}   # 锚定参数
+        self._ewc_fisher: Dict[str, torch.Tensor] = {}        # Fisher 对角
+        self._ewc_lambda: float = 0.05                         # 正则强度
+        self._ewc_enabled: bool = False
+        self._ewc_rounds: int = 0
     
     def calibrate(self):
         """校准自知无知检测器"""
@@ -978,6 +985,91 @@ class DragonBallLearner:
             'energy_before': energy_before,
             'energy_after': energy_after,
             'delta': energy_after - energy_before,
+        }
+
+    def update_ewc_fisher(self, n_samples: int = 200) -> Dict:
+        """更新 EWC Fisher 信息矩阵，锚定当前重要参数。
+
+        每 50 守护轮调用一次。采样锚点计算能量梯度平方作为
+        Fisher 对角近似，标记当前景观的重要参数。
+        后续学习通过 ewc_regularize() 惩罚这些参数的偏移。
+        """
+        device = next(self.landscape.parameters()).device
+        self.landscape.train()
+
+        # 1. 保存参考参数（用于后续计算偏离量）
+        self._ewc_ref_params = {
+            name: p.clone().detach()
+            for name, p in self.landscape.named_parameters()
+        }
+
+        # 2. Fisher 对角 ≈ E[(∂E/∂θ)²]，在随机锚点上采样
+        fisher = {name: torch.zeros_like(p)
+                  for name, p in self.landscape.named_parameters()}
+
+        n_anchors = len(self.anchors.anchors)
+        indices = torch.randperm(n_anchors)[:min(n_samples, n_anchors)]
+        samples = self.anchors.anchors[indices].to(device)
+
+        for x in samples:
+            self.landscape.zero_grad()
+            e = self.landscape(x.unsqueeze(0))
+            e.backward()
+            for name, p in self.landscape.named_parameters():
+                if p.grad is not None:
+                    fisher[name] += p.grad.detach() ** 2
+
+        # 3. 归一化 + 防零
+        for name in fisher:
+            fisher[name] /= n_samples
+            fisher[name].clamp_(min=1e-8)
+
+        self._ewc_fisher = fisher
+        self._ewc_enabled = True
+        self._ewc_rounds = 0
+
+        total_fisher = sum(f.sum().item() for f in fisher.values())
+        return {
+            'status': 'ok',
+            'n_samples': n_samples,
+            'total_fisher_mass': total_fisher,
+            'params_anchored': len(fisher),
+        }
+
+    def ewc_regularize(self) -> Dict:
+        """运行一次 EWC 正则化：用 Adam 将参数拉回锚定点。
+
+        在每次 learn_pairs_batch 后调用，防止新知识推挤旧知识。
+        已启用时做全量 Adam 步，未启用时跳过（零开销）。
+        """
+        if not self._ewc_enabled or not self._ewc_ref_params:
+            return {'status': 'skipped', 'reason': 'ewc not enabled'}
+
+        device = next(self.landscape.parameters()).device
+        self.landscape.train()
+        optimizer = torch.optim.Adam(self.landscape.parameters(), lr=1e-5)
+
+        loss_total = torch.tensor(0.0, device=device)
+        for name, p in self.landscape.named_parameters():
+            if name in self._ewc_ref_params and name in self._ewc_fisher:
+                ref = self._ewc_ref_params[name].to(device)
+                fisher = self._ewc_fisher[name].to(device)
+                loss_total += (fisher * (p - ref) ** 2).sum()
+
+        if loss_total.item() == 0:
+            return {'status': 'skipped', 'reason': 'no ewc params'}
+
+        loss_total = self._ewc_lambda * loss_total
+        optimizer.zero_grad()
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.01)
+        optimizer.step()
+
+        self._ewc_rounds += 1
+        return {
+            'status': 'regularized',
+            'ewc_loss': loss_total.item(),
+            'ewc_rounds': self._ewc_rounds,
         }
 
     def unlearn_chars(
