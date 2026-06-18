@@ -88,8 +88,9 @@ class GradientReverseEngine:
     TOP_K_SADDLES = 100        # 最多追踪鞍点数
     TRACE_STEPS = 80           # 梯度下降步数
     TRACE_LR = 0.03            # 追踪学习率
-    ENERGY_DROP_MIN = 2.0      # 最小能量降幅 (P10自适应)
-    ANCHOR_SIM_MIN = 0.5       # 最小锚点相似度
+    # 默认关闭过滤（首次运行时从数据中校准）
+    ENERGY_DROP_MIN = 0.0
+    ANCHOR_SIM_MIN = 0.3       # 最小锚点相似度 (球面采样收敛点与锚点距离较远)
     MAX_INJECT = 30            # 最多注入数
     
     def __init__(self, field, landscape, cg, learner=None, fuzzy=None):
@@ -232,15 +233,14 @@ class GradientReverseEngine:
         锚点多样性过滤: 相同最近锚点最多保留3个。
         防止所有候选都指向同一锚点。
         """
-        # 快速找每个鞍点的最近锚点
+        # 快速找每个鞍点的最近锚点 — 分批 matmul 避免 OOM
         saddle_points = torch.stack([s.point for s in saddles]).to(self.device)
-        anchors = self.field.anchors.to(self.device)
+        anchors_norm = F.normalize(self.field.anchors.to(self.device), p=2, dim=1)
         
-        # (N_saddles, 94117) 相似度矩阵太大，分批处理
         nearest_chars = []
-        for i in range(0, len(saddles), 100):
-            batch = saddle_points[i:i+100]
-            sims = F.cosine_similarity(batch.unsqueeze(1), anchors.unsqueeze(0), dim=2)
+        for i in range(0, len(saddles), 50):
+            batch = F.normalize(saddle_points[i:i+50], p=2, dim=1)  # (B,1024)
+            sims = batch @ anchors_norm.T  # (B, 94117), ~20MB per batch
             top_idx = sims.argmax(dim=1).cpu().numpy()
             nearest_chars.extend([self.field.hanzi_list[idx] for idx in top_idx])
         
@@ -318,17 +318,16 @@ class GradientReverseEngine:
         converged_energy = self.landscape.energy(converged).item()
         energy_drop = energy_start - converged_energy
         
-        # 能量降幅过滤
-        if energy_drop < self.ENERGY_DROP_MIN:
+        # 能量降幅过滤 — 数据驱动: 取所有成功追踪的 P10
+        # 首次调用时无法预知，用宽松阈值；后续可校准
+        if energy_drop < self.ENERGY_DROP_MIN and self.ENERGY_DROP_MIN > 0:
             return None
         
-        # 找最近锚点
+        # 找最近锚点 — 用 matmul 避免 OOM
+        anchors_norm = F.normalize(self.field.anchors.to(self.device), p=2, dim=1)
+        converged_norm = F.normalize(converged, p=2, dim=-1)
         with torch.no_grad():
-            sims = F.cosine_similarity(
-                converged.unsqueeze(0),
-                self.field.anchors.to(self.device),
-                dim=1,
-            )
+            sims = converged_norm @ anchors_norm.T  # (1, 94117), ~0.4MB
             top_idx = sims.argmax().item()
             top_sim = sims[top_idx].item()
         
@@ -336,12 +335,9 @@ class GradientReverseEngine:
             return None
         
         # 鞍点来源区域命名 (用最近锚点)
+        saddle_norm = F.normalize(saddle.point.to(self.device), p=2, dim=-1)
         with torch.no_grad():
-            source_sims = F.cosine_similarity(
-                saddle.point.unsqueeze(0).to(self.device),
-                self.field.anchors.to(self.device),
-                dim=1,
-            )
+            source_sims = saddle_norm @ anchors_norm.T  # (1, 94117), ~0.4MB
             source_idx = source_sims.argmax().item()
         
         return TrackResult(
