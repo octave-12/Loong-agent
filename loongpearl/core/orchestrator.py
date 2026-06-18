@@ -65,6 +65,9 @@ class Orchestrator:
         self._creative = None
         self._pipeline = None
         self._searcher = None  # ★ 双臂: WebSearcher (惰性加载)
+        self._perturbation = None    # ★ 对抗扰动引擎
+        self._ds_generator = None    # ★ D-S假设生成器
+        self._gradient_reverse = None  # ★ 梯度反推引擎
 
         # ★ 优先学习管道: 交互模式"超出知识范围"→写入队列→守护模式插队处理
         self._pending_path = os.path.join(
@@ -293,6 +296,36 @@ class Orchestrator:
             from loongpearl.web.searcher import WebSearcher
             self._searcher = WebSearcher(timeout=15, cache_enabled=True)
         return self._searcher
+    
+    @property
+    def perturbation(self):
+        """★ 对抗扰动引擎"""
+        if self._perturbation is None:
+            from loongpearl.learning.perturbation_engine import PerturbationEngine
+            self._perturbation = PerturbationEngine(
+                self.field, self.landscape, self.learner, self.fuzzy
+            )
+        return self._perturbation
+    
+    @property
+    def ds_generator(self):
+        """★ D-S假设生成器"""
+        if self._ds_generator is None:
+            from loongpearl.learning.ds_generator import DSHypothesisGenerator
+            self._ds_generator = DSHypothesisGenerator(
+                self.field, self.landscape, self.cg, self.fuzzy, self.learner
+            )
+        return self._ds_generator
+    
+    @property
+    def gradient_reverse(self):
+        """★ 梯度反推引擎"""
+        if self._gradient_reverse is None:
+            from loongpearl.learning.gradient_reverse import GradientReverseEngine
+            self._gradient_reverse = GradientReverseEngine(
+                self.field, self.landscape, self.cg, self.learner, self.fuzzy
+            )
+        return self._gradient_reverse
 
     # ═══════════════════════════════════════════════════════════════════
     # 旧版对话路由 (保留向后兼容)
@@ -1517,6 +1550,28 @@ class Orchestrator:
                 log.warning(f"  双臂搜索/注入异常: {e}")
 
         # ── 3. 定期调度 ──
+        # ★ 每5轮: 对抗扰动 → D-S假设生成 (学习注入后执行)
+        if round_num % 5 == 0:
+            try:
+                pert_report = self.perturbation.run()
+                if pert_report.n_candidates > 0:
+                    tick_report['perturbation'] = {
+                        'candidates': pert_report.n_candidates,
+                        'corrected': pert_report.n_corrected,
+                        'fragility': round(pert_report.fragility_score, 3),
+                    }
+            except Exception as e:
+                log.debug(f"  扰动引擎异常: {e}")
+            try:
+                ds_report = self.ds_generator.run()
+                if ds_report.n_injected > 0:
+                    tick_report['ds_generated'] = {
+                        'combined': ds_report.n_combined,
+                        'injected': ds_report.n_injected,
+                    }
+            except Exception as e:
+                log.debug(f"  D-S生成异常: {e}")
+        
         # 每轮: 衰减
         try:
             if self.learner:
@@ -1578,6 +1633,17 @@ class Orchestrator:
                     tick_report['pyramid'] = p_result
             except Exception as e:
                 log.debug(f"  金字塔异常: {e}")
+            # ★ 每20轮: 梯度反推引擎 — 鞍点→锚点主动知识发现
+            try:
+                gr_report = self.gradient_reverse.run()
+                if gr_report.n_injected > 0:
+                    tick_report['gradient_reverse'] = {
+                        'saddles': gr_report.n_saddles,
+                        'novel': gr_report.n_novel,
+                        'injected': gr_report.n_injected,
+                    }
+            except Exception as e:
+                log.debug(f"  梯度反推异常: {e}")
 
         # 每50轮: EWC Fisher更新 + 锚定参数采样
         if round_num % 50 == 0 and self.learner and hasattr(self.learner, 'update_ewc_fisher'):
