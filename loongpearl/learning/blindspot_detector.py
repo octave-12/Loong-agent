@@ -304,25 +304,36 @@ class StatisticalFactor(FactorDetector):
         景观模式: 从能量景观拓扑检测统计盲区。
         
         原理: 一个字的外出能量偏高 → 龙珠不知道从它出发能去哪 → 盲区。
-        计算每个字作为源字时的外出能量分布，按能量评分排序。
-        不依赖任何外部知识库(idioms.json)，能量景观是唯一知识源。
+        使用相对阈值(百分位)替代绝对阈值，自适应能量景观的当前状态。
         """
         t0 = time.time()
         gaps = []
         
         # 扫描所有字场中的字(限制数量以控制耗时)
         all_chars = list(self.ci.keys())
-        energies = self._compute_outgoing_energies(all_chars, max_chars=5000)
+        energies = self._compute_outgoing_energies(all_chars, max_chars=20000)
+        
+        if not energies:
+            self._last_scan_time = time.time() - t0
+            return gaps
+        
+        # ★ 自适应阈值: 取能量最高的前 15% 作为盲区候选
+        mean_energies = sorted([edata['mean_energy'] for edata in energies.values()])
+        n = len(mean_energies)
+        # 取 P85 作为阈值 — 能量高于此值的字符是盲区
+        threshold_idx = int(n * 0.85)
+        if threshold_idx >= n:
+            threshold_idx = n - 1
+        energy_threshold = mean_energies[threshold_idx] if n > 0 else 0
         
         for ch, edata in energies.items():
-            min_e = edata['min_energy']
             mean_e = edata['mean_energy']
+            min_e = edata['min_energy']
             
-            # 景观盲区判定:
-            #   min_energy > -5: 缺乏深盆地连接(无法轻松达到任何目标)
-            #   mean_energy > -2: 平均外出能量偏高(总体连接差)
-            if min_e > -5.0 or mean_e > -2.0:
-                gap_score = mean_e * (1 + abs(min_e))
+            # 自适应判定: 外出能量处于前15%即为盲区
+            if mean_e >= energy_threshold:
+                # score: 越高越盲，归一化到能量范围
+                gap_score = (mean_e - energy_threshold) * 10
                 gaps.append(BlindSpot(
                     priority=-gap_score,
                     char=ch,
@@ -331,6 +342,7 @@ class StatisticalFactor(FactorDetector):
                     evidence={
                         'min_energy': min_e,
                         'mean_energy': mean_e,
+                        'threshold': energy_threshold,
                         'source': 'energy_landscape_topology',
                     }
                 ))
@@ -603,27 +615,32 @@ class DeadEndFactor(FactorDetector):
         景观模式: 从能量景观拓扑检测死路。
         
         原理: 对每个字计算外出能量分布(min_energy, mean_energy),
-        min_energy 高 → 该字无法低能地到达任何目标字 → 死路。
-        
-        死路分类:
-          - 硬死路: min_energy > 0 (完全没有低能通路，所有目标都高能)
-          - 软死路: min_energy > -2 (只有极少高能通路，容易重复)
-        
-        不依赖任何外部知识库(idioms.json)，能量景观是唯一知识源。
+        使用百分位自适应阈值替代绝对阈值。
         """
         t0 = time.time()
         gaps = []
         
         all_chars = list(self.ci.keys())
-        energies = self._compute_outgoing_energies(all_chars, max_chars=5000)
+        energies = self._compute_outgoing_energies(all_chars, max_chars=20000)
+        
+        if not energies:
+            self._last_scan_time = time.time() - t0
+            return gaps
+        
+        # ★ 自适应阈值: min_energy 最高的前15%为死路候选
+        min_energies = sorted([edata['min_energy'] for edata in energies.values()])
+        n = len(min_energies)
+        threshold_idx = int(n * 0.85)
+        if threshold_idx >= n:
+            threshold_idx = n - 1
+        min_threshold = min_energies[threshold_idx] if n > 0 else 0
         
         for ch, edata in energies.items():
             min_e = edata['min_energy']
             mean_e = edata['mean_energy']
             
-            # 硬死路: min_energy > 0 → 所有采样目标都高能，无低能通路
-            if min_e > 0.0:
-                gap_score = (min_e + 5.0) * 3.0
+            if min_e >= min_threshold:
+                gap_score = (min_e - min_threshold) * 10
                 gaps.append(BlindSpot(
                     priority=-gap_score,
                     char=ch,
@@ -632,22 +649,7 @@ class DeadEndFactor(FactorDetector):
                     evidence={
                         'min_energy': min_e,
                         'mean_energy': mean_e,
-                        'is_hard_dead_end': True,
-                        'source': 'energy_landscape_topology',
-                    }
-                ))
-            # 软死路: -2 <= min_energy <= 0 → 只有少数高能通路
-            elif min_e > -2.0:
-                gap_score = (min_e + 2.0) * 1.5 + mean_e
-                gaps.append(BlindSpot(
-                    priority=-gap_score,
-                    char=ch,
-                    factor=self.name,
-                    score=gap_score,
-                    evidence={
-                        'min_energy': min_e,
-                        'mean_energy': mean_e,
-                        'is_soft_dead_end': True,
+                        'threshold': min_threshold,
                         'source': 'energy_landscape_topology',
                     }
                 ))

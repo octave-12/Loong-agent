@@ -314,20 +314,17 @@ class SelfEvolvingLoongPearl:
 
     def _micro_learn(self, query_vec: torch.Tensor, keywords: list):
         """
-        极小步长 Hebbian 植入, 仅对交叉验证共识的关键词。
+        ★ 写入权归大脑: 不再直接 hebbian.update。
+        改为返回建议列表, orchestrator 统一注入。
+
         学习率 = 基础值 × 源数 / 10  (单源不学, 双源 0.0002, 极高共识 0.001)
         """
+        suggestions = []
         for hanzi, freq in keywords[:8]:
             if hanzi not in self.zc._char_to_idx: continue
-            # 学习率与交叉验证强度成正比, 上限 0.001
             micro_lr = min(0.001, 0.0001 * freq)
-            try:
-                self.lr.hebbian.update(
-                    query_vec,
-                    self.zc.anchors[self.zc._char_to_idx[hanzi]],
-                    feedback=micro_lr,
-                )
-            except: pass
+            suggestions.append((hanzi, micro_lr))
+        return suggestions
 
     # ── 回答生成 ──────────────────────────────
 

@@ -64,6 +64,7 @@ class ConceptGraphSQLite:
         c.execute("CREATE INDEX IF NOT EXISTS idx_triples_s ON triples(s)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_triples_sr ON triples(s, r)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_triples_r ON triples(r)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_triples_o ON triples(o)")
         c.commit()
 
     # ── 迁移 ──
@@ -148,6 +149,43 @@ class ConceptGraphSQLite:
 
     def count_triples(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0]
+
+    def query_char_pairs(self, char: str, min_conf: float = 0.1,
+                         limit: int = 100) -> List[Tuple[str, str, float]]:
+        """O(log N): 查询包含某字的字符对（双向），用于守护注入。
+
+        用 UNION 分别走 idx_triples_s 和 idx_triples_o 索引，
+        避免 OR 导致的 full table scan。
+
+        Returns: [(char_a, char_b, confidence), ...] 去重
+        """
+        import re as _re
+        # ★ UNION 替代 OR，各自走索引（子查询包裹以支持 ORDER BY + LIMIT）
+        rows = self.conn.execute("""
+            SELECT s, o, c FROM (
+                SELECT s, o, c FROM triples WHERE s=? AND c>=? ORDER BY c DESC LIMIT ?
+            )
+            UNION ALL
+            SELECT s, o, c FROM (
+                SELECT s, o, c FROM triples WHERE o=? AND c>=? ORDER BY c DESC LIMIT ?
+            )
+        """, (char, min_conf, limit, char, min_conf, limit)).fetchall()
+
+        pairs = []
+        seen = set()
+        for s, o, c in rows:
+            s_chars = _re.findall(r'[\u4e00-\u9fff]', s)
+            o_chars = _re.findall(r'[\u4e00-\u9fff]', o)
+            for ca in s_chars:
+                for cb in o_chars:
+                    if ca != cb:
+                        key = (ca, cb) if ca < cb else (cb, ca)
+                        if key not in seen:
+                            seen.add(key)
+                            pairs.append((ca, cb, c))
+                            if len(pairs) >= limit:
+                                return pairs
+        return pairs
 
     def stats(self) -> Dict:
         c = self.conn

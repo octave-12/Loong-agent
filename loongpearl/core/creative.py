@@ -100,45 +100,36 @@ class PoetryEngine:
         self._build_bigram_table()
 
     def _build_bigram_table(self):
-        """从概念图 JSON 直接提取字对共现（绕过 ConceptGraph 类，秒级加载）"""
+        """从概念图提取字对共现（POETIC_NEXT + 概念名切片）"""
         # 1. 注入诗意种子
         self._seed_poetic_bigrams()
 
-        # 2. 尝试从概念图 JSON 直接提取字对
-        import os, json
-        # 定位概念图文件 (orchestrator 在 loongpearl/core/ 下)
-        _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        cg_path = os.path.join(_root, 'data', 'models', 'concept_graph.json')
-
-        if not os.path.exists(cg_path):
-            # 尝试相对路径
-            for candidate in ['data/models/concept_graph.json',
-                             '../data/models/concept_graph.json']:
-                if os.path.exists(candidate):
-                    cg_path = candidate
-                    break
-
-        if not os.path.exists(cg_path):
-            return  # 只能用种子
-
-        try:
-            with open(cg_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            # 从三元组的 s(ubject) 和 o(bject) 中提取多字概念名
+        # 2. 从概念图对象提取 (优先，已在内存中)
+        if self.cg and hasattr(self.cg, 'triples'):
             count = 0
-            for t in data.get('triples', []):
-                for key in ('s', 'o'):
-                    name = t.get(key, '')
-                    if isinstance(name, str):
-                        for i in range(len(name) - 1):
-                            a, b = name[i], name[i + 1]
-                            if '\u4e00' <= a <= '\u9fff' and '\u4e00' <= b <= '\u9fff':
-                                # 概念图中的共现加权较高
-                                self._bigram_freq[(a, b)] = self._bigram_freq.get((a, b), 0) + 1
-                                count += 1
-        except Exception:
-            pass  # 加载失败也不影响，用种子即可
+            for key, triple in self.cg.triples.items():
+                # POETIC_NEXT: s 和 o 都是单字
+                if triple.relation == 'POETIC_NEXT':
+                    s, o = triple.subject, triple.object
+                    if (isinstance(s, str) and len(s) == 1 and
+                        isinstance(o, str) and len(o) == 1 and
+                        '\\u4e00' <= s <= '\\u9fff' and '\\u4e00' <= o <= '\\u9fff'):
+                        w = getattr(triple, 'evidence_count', triple.confidence * 10) or 1
+                        self._bigram_freq[(s, o)] = self._bigram_freq.get((s, o), 0) + int(w)
+                        count += 1
+                # 多字概念名内部切片
+                else:
+                    for name in (triple.subject, triple.object):
+                        if isinstance(name, str) and len(name) >= 2:
+                            for i in range(len(name) - 1):
+                                a, b = name[i], name[i + 1]
+                                if '\\u4e00' <= a <= '\\u9fff' and '\\u4e00' <= b <= '\\u9fff':
+                                    self._bigram_freq[(a, b)] = self._bigram_freq.get((a, b), 0) + 1
+                                    count += 1
+        
+        # 3. 兜底：如果 cg 对象不可用，使用内置诗意字对作为基础
+        if not self.cg or len(self._bigram_freq) < 1000:
+            pass  # _build_bigram_from_json 未实现，已由 _seed_poetic_bigrams 覆盖
 
     def _seed_poetic_bigrams(self):
         """注入经典诗意字对"""

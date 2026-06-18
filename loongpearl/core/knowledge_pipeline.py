@@ -642,17 +642,17 @@ class KnowledgePipeline:
 
         self.stats['total_triples_added'] += total_added
 
-        # ── 2. 能量景观: Hebbian更新字对共现 ──
-        if result.bigrams and self.learner and hasattr(self.learner, 'inject_pairs'):
-            try:
-                pair_list = [(a, b) for (a, b), freq in result.bigrams.items()
-                            if freq >= 2]
-                if pair_list:
-                    n = self.learner.inject_pairs(pair_list)
-                    self.stats['total_energy_updates'] += n
-                    self.stats['total_bigrams_added'] += len(pair_list)
-            except Exception:
-                pass
+        # ★ 能量景观写入权归大脑: bigrams 数据仅汇总统计
+        # orchestrator 的 daemon_tick 负责统一收集 bigrams 后调用 learner
+        if result.bigrams:
+            pair_list = [(a, b) for (a, b), freq in result.bigrams.items()
+                        if freq >= 2]
+            if pair_list:
+                self.stats['total_bigrams_added'] += len(pair_list)
+                # 挂起待注入: orchestrator 后续统一读取并执行 Hebbian
+                if not hasattr(self, '_pending_bigrams'):
+                    self._pending_bigrams = []
+                self._pending_bigrams.extend(pair_list)
 
         # ── 3. 万象格: 注入过程和条件 ──
         if result.processes and self.orch and self.orch._mkg:

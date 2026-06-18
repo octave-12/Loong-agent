@@ -386,11 +386,8 @@ class LoongPearl:
         nearest_chars = [ch for ch, _ in resolved]
         similarities = [sim for _, sim in resolved]
         
-        # 用进：强化查询→收敛点的路径（提升未来查询效率）
-        try:
-            self.learner.learn(query_vec, infer_result['state'], feedback=0.3)
-        except Exception:
-            pass  # 强化失败不影响主流程
+        # ★ 写入权归大脑: 对话引擎不直接写能量景观
+        # 学习反馈由 orchestrator._handle_signal 闭环统一执行
         
         # 废退：每N次查询后触发一次衰减（清理久未使用的知识）
         if self.total_queries % 50 == 0:
@@ -478,9 +475,12 @@ class LoongPearl:
                     target_idx = self.zichang._char_to_idx[hanzi]
                     target_vec = self.zichang.anchors[target_idx].to(self.device)
                     
-                    result = self.learner.learn(query_vec, target_vec, feedback=0.5)
-                    if result.get('status') != 'skipped':
-                        implanted += 1
+                    # ★ 写入权归大脑: 不直接调 learner.learn
+                    # 将待强化字对暂存, orchestrator 统一注入
+                    if not hasattr(self, '_pending_reinforce'):
+                        self._pending_reinforce = []
+                    self._pending_reinforce.append((hanzi, 0.5))
+                    implanted += 1
                 
                 if implanted > 0:
                     # 学习后保存能量景观

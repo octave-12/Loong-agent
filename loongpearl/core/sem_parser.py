@@ -703,7 +703,7 @@ class SemParser:
         elif intent == QueryIntent.CHECK_TRUTH:
             query["verify"] = {"subject": subject, "object": obj, "predicate": predicate}
         elif intent == QueryIntent.DEFINE:
-            query["define"] = subject or (concepts[0] if concepts else text)
+            query["define"] = subject or (concepts[0] if concepts else "")
 
         return query
 

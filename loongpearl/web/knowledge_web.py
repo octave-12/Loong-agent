@@ -95,9 +95,14 @@ class WebAwareLoongPearl:
         if auto_web and not is_known:
             keywords = self.searcher.search(text)
             if keywords:
-                imp = self._implant(vec, text, keywords)
+                suggestions = self._implant(vec, text, keywords)
+                imp = len(suggestions)
                 self.web_learned += 1
                 self.web_implanted += imp
+                # ★ 待注入建议暂存，由 orchestrator 统一执行 Hebbian
+                if not hasattr(self, '_pending_implant'):
+                    self._pending_implant = []
+                self._pending_implant.extend(suggestions)
                 # 重查
                 self.ls.train()
                 result2 = self.ls.infer(vec, steps=50)
@@ -130,16 +135,12 @@ class WebAwareLoongPearl:
         return f"未找到「{query}」的关联汉字"
 
     def _implant(self, query_vec, query_text, keywords):
-        imp = 0
+        """★ 写入权归大脑: 不再直接 hebbian.update, 返回建议列表"""
+        suggestions = []
         for hanzi, freq in keywords[:10]:
             if hanzi not in self.zc._char_to_idx: continue
-            try:
-                r = self.lr.hebbian.update(
-                    query_vec, self.zc.anchors[self.zc._char_to_idx[hanzi]],
-                    feedback=min(0.5, freq / 20))
-                if r.get('status') != 'skipped': imp += 1
-            except: pass
-        return imp
+            suggestions.append((hanzi, min(0.5, freq / 20)))
+        return suggestions
 
     def save(self, path=None):
         self.ls.save(path or LANDSCAPE)

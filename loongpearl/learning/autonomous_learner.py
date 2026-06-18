@@ -243,7 +243,9 @@ class AutonomousLearner:
                     batch_pairs.append((ia, ib))
             
             if batch_pairs:
-                self.learner.learn_pairs_batch(batch_pairs, learning_rate=0.05)
+                # ★ 写入权归大脑: 不直接调用 learner.learn_pairs_batch
+                # 返回 pairs 数据供 orchestrator 统一注入
+                self._pending_inject_pairs = batch_pairs
                 total_pairs += len(batch_pairs)
             
             if verbose and (i + batch_size) % 2000 == 0:
@@ -445,8 +447,10 @@ class AutonomousLearner:
         else:
             lr = 0.01
         
-        result = self.learner.learn_pairs_batch(pairs, learning_rate=lr)
-        return result.get('pairs_learned', len(pairs))
+        # ★ 写入权归大脑: 不直接调用 learner.learn_pairs_batch
+        # 返回 pairs 数据供 orchestrator 统一注入
+        self._pending_inject_pairs = pairs
+        return len(pairs)
     
     def save_concept_graph(self) -> bool:
         """保存概念图到磁盘"""

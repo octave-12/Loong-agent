@@ -134,46 +134,83 @@ class ContraResolver:
         self.cg = concept_graph
         self.conflicts: List[Conflict] = []
         self.resolution_log: List[Dict[str, Any]] = []
+        self._subject_index = None  # lazy-built O(1) lookup
+        self._triples_sample = None  # cached sample for iterating
 
     # ═════════════════════════════════════════════════════════════════════
     # 全面检测
     # ═════════════════════════════════════════════════════════════════════
 
-    def detect_all(self) -> List[Conflict]:
-        """运行所有检测器，返回发现的冲突列表"""
+    def detect_all(self, max_time_sec: float = 30.0) -> List[Conflict]:
+        """运行所有检测器，返回发现的冲突列表。max_time_sec 硬性超时保护"""
+        import time
+        t_start = time.time()
+        
+        def _timed_out():
+            return time.time() - t_start > max_time_sec
+        
         self.conflicts = []
 
         if not self.cg or not hasattr(self.cg, 'triples'):
             print("[矛盾解] 无概念图，跳过检测")
             return []
+        
+        self._build_subject_index()
 
-        self.conflicts.extend(self.detect_cycles())
-        self.conflicts.extend(self.detect_opposing())
-        self.conflicts.extend(self.detect_property_conflicts())
-        self.conflicts.extend(self.detect_causal_conflicts())
+        # 检测器按开销排序: 便宜的优先
+        if not _timed_out():
+            self.conflicts.extend(self.detect_opposing())
+        if not _timed_out():
+            self.conflicts.extend(self.detect_causal_conflicts())
+        if not _timed_out():
+            self.conflicts.extend(self.detect_property_conflicts())
+        if not _timed_out():
+            self.conflicts.extend(self.detect_cycles())  # DFS最贵，放最后
 
-        print(f"[矛盾解] 检测完成: {len(self.conflicts)} 个冲突")
+        elapsed = time.time() - t_start
+        print(f"[矛盾解] 检测完成 ({elapsed:.1f}s): {len(self.conflicts)} 个冲突")
         return self.conflicts
 
     # ═════════════════════════════════════════════════════════════════════
     # 检测器 1: 环路检测
     # ═════════════════════════════════════════════════════════════════════
 
+    def _build_subject_index(self):
+        """懒构建 O(1) 主语索引，避免每次 list() 全量 193 万三元组"""
+        if self._subject_index is not None:
+            return
+        from collections import defaultdict
+        self._subject_index = defaultdict(list)
+        # 取前 10 万条三元组建索引（足够覆盖常用知识）
+        count = 0
+        for key, t in self.cg.triples.items():
+            if count >= 100000:
+                break
+            if hasattr(t, 'subject'):
+                self._subject_index[t.subject].append(
+                    (t.relation, t.object, t.confidence, t.source))
+                count += 1
+        self._triples_sample = list(self.cg.triples.keys())[:20000]  # 缓存键样本
+
     def _get_triples_for(self, subject: str) -> List[Tuple[str, str, float, str]]:
-        """适配概念图 Triple 格式: 返回 (relation, object, conf, source) 列表"""
-        results = []
-        for key, t in list(self.cg.triples.items())[:50000]:
-            if hasattr(t, 'subject') and t.subject == subject:
-                results.append((t.relation, t.object, t.confidence, t.source))
-        return results
+        """O(1) 索引查找，替代原 list(self.cg.triples.items())[:50000] 全量扫描"""
+        self._build_subject_index()
+        return self._subject_index.get(subject, [])
 
     def detect_cycles(self) -> List[Conflict]:
         """检测 IS_A 和 PART_OF 环路"""
         conflicts = []
 
         # 对每个节点做 DFS 检测环路
+        self._build_subject_index()
+        key_sample = self._triples_sample[:3000]  # 只用缓存样本，避免 list() 全量
+        max_iterations = 5000  # 硬上限：最多探测 5000 个起点
+        it = 0
         for rel_type in ['IS_A', 'PART_OF']:
-            for start_node in list(self.cg.triples.keys())[:10000]:
+            for start_node in key_sample:
+                it += 1
+                if it > max_iterations:
+                    break
                 cycle = self._find_cycle(start_node, start_node, rel_type, set())
                 if cycle and len(cycle) > 1:
                     s = Severity.CRITICAL if rel_type == 'IS_A' else Severity.HIGH
@@ -224,8 +261,8 @@ class ContraResolver:
     def detect_opposing(self) -> List[Conflict]:
         """检测同一对节点同时有 IS_A 和 OPPOSITE 关系"""
         conflicts = []
-
-        for s in list(self.cg.triples.keys())[:10000]:
+        self._build_subject_index()
+        for s in self._triples_sample[:5000]:
             if s not in self.cg.triples:
                 continue
 
@@ -254,8 +291,8 @@ class ContraResolver:
     def detect_property_conflicts(self) -> List[Conflict]:
         """检测 HAS 关系的属性冲突"""
         conflicts = []
-
-        for s in list(self.cg.triples.keys())[:10000]:
+        self._build_subject_index()
+        for s in self._triples_sample[:5000]:
             if s not in self.cg.triples:
                 continue
 
@@ -289,8 +326,8 @@ class ContraResolver:
     def detect_causal_conflicts(self) -> List[Conflict]:
         """检测同时存在 CAUSE 和 PREVENTS 关系的节点对"""
         conflicts = []
-
-        for s in list(self.cg.triples.keys())[:10000]:
+        self._build_subject_index()
+        for s in self._triples_sample[:5000]:
             if s not in self.cg.triples:
                 continue
 

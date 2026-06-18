@@ -212,8 +212,8 @@ class Orchestrator:
     @property
     def decoder(self):
         if self._decoder is None:
-            from loongpearl.core.energy_decoder import EnergyDecoder
-            self._decoder = EnergyDecoder()
+            from loongpearl.core.hybrid_decoder import HybridDecoder
+            self._decoder = HybridDecoder()
         return self._decoder
 
     @property
@@ -390,7 +390,7 @@ class Orchestrator:
         self._sync_fuzzy_to_cg()
 
         render_input = self._build_render_input(frame, exec_results, query)
-        result['output'] = self.decoder.render(render_input)
+        result['output'] = self.decoder.decode(render_input)
         return result
 
     def _build_render_input(self, frame, exec_results, query) -> Dict:
@@ -589,7 +589,7 @@ class Orchestrator:
 
         # ★ 无汉字且非计算类 → 兜底渲染
         if not query_chars:
-            result['answer'] = self.decoder.render({
+            result['answer'] = self.decoder.decode({
                 'render_type': 'fact_statement',
                 'facts': [{'relation': 'RELATED', 'object': question_text,
                            'subject': '未知'}],
@@ -651,7 +651,7 @@ class Orchestrator:
             facts = [{'relation': r['relation'], 'object': r['object'],
                       'subject': r['subject'], 'confidence': r['confidence']}
                      for r in cg_result[:5]]
-            result['answer'] = self.decoder.render({
+            result['answer'] = self.decoder.decode({
                 'render_type': 'list_related',
                 'subject': question_text,
                 'facts': facts,
@@ -1045,8 +1045,13 @@ class Orchestrator:
     # ★ 辅助方法: 知识提取与路径操作
     # ═══════════════════════════════════════════════════════════════════
 
-    def _extract_pairs_from_search(self, search_response, context: str) -> List[Tuple[int, int]]:
-        """从搜索结果中提取相邻汉字对 (复用 autonomous_learner 逻辑)"""
+    def _extract_pairs_from_search(self, search_response, context: str,
+                                    use_llm: bool = True) -> List[Tuple[int, int]]:
+        """从搜索结果中提取字对: 相邻字对 + DualExtractor 结构化三元组 → 字对
+
+        Args:
+            use_llm: 是否启用 LLM 兜底（守护模式禁用，防 Ollama 超时拖慢循环）
+        """
         import re as _re
         from collections import Counter as _Counter
 
@@ -1054,6 +1059,7 @@ class Orchestrator:
         all_text = ' '.join(r.snippet for r in search_response.results[:5] if r.snippet)
         all_text += ' ' + (search_response.answer or '')
 
+        # ── 原有: 相邻汉字对提取 ──
         cn_chars = _re.findall(r'[\u4e00-\u9fff]', all_text)
         for i in range(len(cn_chars) - 1):
             a, b = cn_chars[i], cn_chars[i + 1]
@@ -1065,6 +1071,26 @@ class Orchestrator:
             a, b = query_chars[i], query_chars[i + 1]
             if a in self.field._char_to_idx and b in self.field._char_to_idx:
                 pair_counter[(a, b)] += 2
+
+        # ── ★ DualExtractor: 结构化三元组 → 字对 (更高质量) ──
+        if hasattr(self, '_dual_extractor') and self._dual_extractor:
+            try:
+                # 守护模式仅正则提取（快），聊天模式可 LLM 兜底
+                if use_llm:
+                    triples = self._dual_extractor.extract(all_text[:3000])
+                else:
+                    triples = self._dual_extractor.extract_regex(all_text[:3000])
+                for s, r, o, conf in triples:
+                    # 从三元组的主语和宾语提取字对
+                    s_chars = _re.findall(r'[\u4e00-\u9fff]', s)
+                    o_chars = _re.findall(r'[\u4e00-\u9fff]', o)
+                    weight = int(conf * 5)  # 0.5→2, 0.7→3
+                    for ca in s_chars:
+                        for cb in o_chars:
+                            if ca in self.field._char_to_idx and cb in self.field._char_to_idx:
+                                pair_counter[(ca, cb)] += weight
+            except Exception:
+                pass
 
         pairs = []
         for (a, b), freq in pair_counter.most_common(50):
@@ -1277,7 +1303,7 @@ class Orchestrator:
                     for c in candidates[:3]
                 ],
             }
-            return self.decoder.render(render_input)
+            return self.decoder.decode(render_input)
         except Exception:
             return f"关于「{question}」，最相关的概念是：{'、'.join(candidates[:3])}。"
 
@@ -1586,14 +1612,7 @@ class Orchestrator:
         """
         🦾 对盲区队列批量搜索，提取字对——不积压，直接返回。
 
-        复用 auto_learn 的多查询策略:
-          dead_end    → "{char}字开头的成语有哪些", "{char}成语大全"
-          gradient    → "{char} 成语 释义", "{char}字 组词 常见词语", "含有{char}字的词语 成语"
-          semantic    → "{char}{related} 成语 词语", "{char}和{related} 成语 组词"
-          statistical → "{char} 成语接龙", "{char}字 常见词语"
-          coverage    → "{char} 成语 用法 释义", "{char} 组词"
-          freshness   → "{char}字 组词 新词语"
-          其他        → "{char} 组词 成语 搭配"
+        数据源优先级: SQLite加速 → 概念图邻接索引 → 网络搜索(DualExtractor) → 本地词典
 
         Returns: [(ia, ib), ...] 去重字对索引列表
         """
@@ -1602,30 +1621,50 @@ class Orchestrator:
             char = gap.char
             factor = getattr(gap, 'factor', 'unknown')
 
-            # ── ★ 概念图优先: O(1)本地查找，有足够对就跳过网络 ──
+            # ── ★ 第一数据源: SQLite O(log N) 索引查询 1.93M 三元组 ──
+            sqlite_pairs = []
+            if hasattr(self, '_cgdb') and self._cgdb:
+                try:
+                    raw_pairs = self._cgdb.query_char_pairs(char, min_conf=0.1, limit=50)
+                    for ca, cb, conf in raw_pairs:
+                        ia = self.field._char_to_idx.get(ca)
+                        ib = self.field._char_to_idx.get(cb)
+                        if ia is not None and ib is not None:
+                            sqlite_pairs.append((ia, ib))
+                except Exception:
+                    pass
+
+            # ── 第二数据源: 概念图邻接索引 O(1) ──
             cg_pairs = []
             if hasattr(self.cg, 'get_char_pairs'):
                 cg_pairs = self.cg.get_char_pairs(char, max_pairs=50)
-            
-            if len(cg_pairs) >= 20:
-                # 概念图足够覆盖 → 跳过搜索，直接使用
-                all_pairs.extend(cg_pairs)
+
+            # 合并去重
+            seen_local = set()
+            combined = []
+            for p in sqlite_pairs + cg_pairs:
+                if p not in seen_local:
+                    seen_local.add(p)
+                    combined.append(p)
+
+            if len(combined) >= 10:
+                # 本地数据足够（≥10对）→ 跳过网络搜索
+                all_pairs.extend(combined)
                 continue
 
-            # 概念图不足 → 补充网络搜索
-            all_pairs.extend(cg_pairs)
+            # 本地不足 → 补充网络搜索（仅1个查询，不再3个）
+            all_pairs.extend(combined)
 
-            # 多查询策略
-            queries = self._build_search_queries(char, factor)
-            for query in queries:
-                try:
-                    search_response = self.searcher.search(query, max_results=5)
-                    if search_response and search_response.results:
-                        pairs = self._extract_pairs_from_search(search_response, query)
-                        all_pairs.extend(pairs)
-                except Exception:
-                    continue
-                time.sleep(0.3)  # 减少等待
+            # 精简查询策略: 只用最有效的1个查询
+            query = f"{char} 组词 成语 搭配"
+            try:
+                search_response = self.searcher.search(query, max_results=3)
+                if search_response and search_response.results:
+                    pairs = self._extract_pairs_from_search(
+                        search_response, query, use_llm=False)
+                    all_pairs.extend(pairs)
+            except Exception:
+                pass
 
             # 本地词典补充
             try:
@@ -1986,7 +2025,7 @@ def create_orchestrator(field, landscape, learner=None) -> Orchestrator:
 
 
 def create_orchestrator_with_sequential(field, landscape, learner=None) -> Orchestrator:
-    """创建调度器并加载序列臂有向字对 + SQLite 查询加速"""
+    """创建调度器并加载序列臂有向字对 + SQLite 查询加速 + DualExtractor"""
     orch = create_orchestrator(field, landscape, learner)
     orch._load_directed_pairs()
 
@@ -2002,5 +2041,14 @@ def create_orchestrator_with_sequential(field, landscape, learner=None) -> Orche
     except Exception as e:
         log.warning(f"  SQLite加速初始化失败: {e}")
         orch._cgdb = None
+
+    # ★ DualExtractor: 正则+LLM双重知识提取
+    try:
+        from loongpearl.learning.dual_extractor import DualExtractor
+        orch._dual_extractor = DualExtractor()
+        log.info("  DualExtractor: 正则+LLM双重提取就绪")
+    except Exception as e:
+        log.warning(f"  DualExtractor初始化失败: {e}")
+        orch._dual_extractor = None
 
     return orch
