@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)](https://pytorch.org/)
 [![GPU](https://img.shields.io/badge/GPU-RTX%203060-green.svg)]()
-[![Version](https://img.shields.io/badge/version-v2.3-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-v2.5-orange.svg)]()
 
 ---
 
@@ -325,6 +325,20 @@ loong-pearl/
 ---
 
 ## 📋 变更日志
+
+### v2.5 (2026-06-19) — 三引擎创造架构实现
+
+- **三引擎全部实现为运行代码** (非设计文档):
+  - `perturbation_engine.py`: 对抗扰动 — 2000锚点子集→低相似远距对→参数噪声→D-S验证→负Hebbian修正 (0.3s)
+  - `ds_generator.py`: D-S假设生成器 — 扰动+弱边+高相似三源→Dempster组合→注入 (0.1s)
+  - `gradient_reverse.py`: 梯度反推 — 20K球面采样→P75/P90鞍点→负梯度追踪→锚点注入 (5.2s)
+- **四层知识漏斗**: L1本地SQLite→L2 Wikipedia Dump→L3 Bing+Baidu双引擎并发→L4本地词典
+- **搜索架构重写**: 删除百度百科/Google HTML抓取, Bing CN实测1.1s/75%置信度
+- **熔断/限速/UA轮转**: `rate_limiter.py` 引擎级熔断器+请求抖动
+- **策应器规则模板**: `policy_query.py` 7因子→查询模板映射
+- **守护集成**: 每5轮扰动+D-S, 每20轮梯度反推
+- **消除 cosine_similarity(unsqueeze)**: 全链路 `norm @ matmul` 避免 OOM (修复3处95GB→100MB)
+- **守护速度**: 40-56s/轮 (vs 原80s, -35%)
 
 ### v2.3 (2026-06-18) — 三引擎创造架构 + 全链路 GPU 加速
 
