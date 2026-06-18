@@ -154,15 +154,17 @@ def load_concept_graph(field, landscape):
 
 def run_chat(field, landscape, args):
     """
-    交互式对话模式 — NLU → 规划 → 多引擎查询 → NLG 全链路。
-    使用 Orchestrator 调度 8 引擎。
+    交互式对话模式 — 五步信号驱动管道 (v3)。
+    使用 Orchestrator.query() 实现解义→策应→梯度下降→信号处理→化能。
     """
     from loongpearl.core.orchestrator import create_orchestrator
 
     orch = create_orchestrator(field, landscape)
 
     print("\n" + orch.status_report())
-    print("\n输入 'quit' 退出, 'status' 查看状态\n")
+    print("\n输入 'quit' 退出, 'status' 查看状态, 'debug' 切换调试\n")
+
+    show_debug = False
 
     while True:
         try:
@@ -177,37 +179,38 @@ def run_chat(field, landscape, args):
         if query.lower() == 'status':
             print(orch.status_report())
             continue
+        if query.lower() == 'debug':
+            show_debug = not show_debug
+            print(f"调试模式: {'开' if show_debug else '关'}")
+            continue
 
-        # 全栈处理
-        result = orch.dialogue(query)
+        # ★ 五步信号驱动管道
+        result = orch.query(query)
 
-        # 输出（根据路由类型显示不同格式）
-        rtype = result.get('type', 'knowledge')
-        debug = result.get('debug', {})
+        # 输出回答（已自带置信度标签 ✅⚠️🆕❓）
+        answer = result.get('answer', str(result))
+        print(f"\n{answer}")
 
-        if rtype == 'social':
-            print(f"\n🐉 {result['output']}")
-        elif rtype == 'chitchat':
-            print(f"\n💭 {result['output']}")
-        elif rtype == 'creative':
-            ctype = debug.get('creative_type', '')
-            emoji = "📜" if ctype == 'poetry' else "🔗" if ctype == 'idiom_chain' else "📖"
-            print(f"\n{emoji} 创作结果:\n{result['output']}")
-        elif rtype == 'knowledge':
-            frame = debug.get('frame', {})
-            print(f"\n📋 [{frame.get('type', '查询')}] "
-                  f"{frame.get('subject', query)}")
-            if 'cross_lang' in debug:
-                print(f"🌐 {debug['cross_lang']}")
-            if debug.get('context_enhanced'):
-                print(f"💡 (上下文增强)")
-            print(f"💬 {result['output']}")
-            if 'cross_form' in debug:
-                forms = [k for k, v in debug['cross_form'].items() if v]
-                if forms:
-                    print(f"🔗 万象格: {', '.join(forms)}")
-        else:
-            print(f"\n💬 {result['output']}")
+        # 调试信息
+        if show_debug:
+            signal = result.get('signal', '?')
+            confidence = result.get('confidence', 0)
+            debug = result.get('debug', {})
+            infer = debug.get('infer', {})
+            final = debug.get('final', {})
+
+            print(f"  ── 调试 ──")
+            print(f"  信号: {signal}  置信度: {confidence:.0%}")
+            print(f"  查询字: {debug.get('query_chars', [])}")
+            if infer:
+                print(f"  初始推理: signal={infer.get('signal')} "
+                      f"energy={infer.get('energy',0):.2f} "
+                      f"steps={infer.get('steps',0)} "
+                      f"candidates={infer.get('top_candidates',[])}")
+            if final:
+                print(f"  最终推理: signal={final.get('signal')} "
+                      f"energy={final.get('energy',0):.2f} "
+                      f"detail={final.get('signal_detail','')[:60]}")
 
 
 # ============================================================================
@@ -419,70 +422,113 @@ def run_contra(field, landscape, args):
 
 
 # ============================================================================
-# 模式: 守护进程 (增强版 — 集成8引擎)
+# 模式: 守护进程 v2 — 信号驱动统一循环
 # ============================================================================
 
 def run_daemon(field, landscape, learner, args):
-    """7×24自主学习守护进程 — Orchestrator 调度 8 引擎"""
-    from scripts.auto_learn import AutoLearningDaemon
-    from loongpearl.core.orchestrator import create_orchestrator
+    """
+    7×24自主学习守护进程 v2 — 大脑扫描→双臂搜索→当场吸收。
 
-    # 创建调度器（单一概念图引用，所有引擎共享）
-    orch = create_orchestrator(field, landscape, learner)
+    每轮:
+      1. 🧠 大脑扫描盲区 (MultiFactorDetector 7因子)
+      2. 🦾 双臂搜索 + 当场吸收 (搜索→提取字对→Hebbian注入)
+      3. 定期调度 (衰减/矛盾解/D-S/验证/剪枝/金字塔)
+      4. 保存 (learned > 0 时)
+    """
+    import signal
+    from loongpearl.core.orchestrator import create_orchestrator_with_sequential
 
-    daemon = AutoLearningDaemon(
-        scan_interval=args.interval,
-        max_learn_per_round=args.max_learn,
-        factors=None,
-        from_landscape=True,
-        start_stage=args.stage,
-    )
-    daemon.field = field
-    daemon.landscape = landscape
-    daemon.learner = learner
+    orch = create_orchestrator_with_sequential(field, landscape, learner)
+    model_path = os.path.join(PROJECT, 'data', 'models', 'energy_landscape_1024d.pt')
+    cg_path = os.path.join(PROJECT, 'data', 'models', 'concept_graph')
 
-    # 🔑 把 autonomous learner 的概念图替换为 orch 的引用（同一个cg）
-    if hasattr(daemon, 'autonomous') and daemon.autonomous:
-        daemon.autonomous.concept_graph = orch.cg
+    running = True
+    def _shutdown(sig, frame):
+        nonlocal running
+        log.info("\n🛑 收到停止信号, 保存后退出...")
+        running = False
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
-    # 用 Orchestrator 增强每轮循环
-    _original_run_round = daemon.run_round
+    # 注入锁: 概念图批量注入期间守护暂停，防止竞态
+    lock_path = os.path.join(PROJECT, 'data', 'runtime', 'inject.lock')
+    was_locked = False
 
-    def enhanced_run_round():
-        _original_run_round()
+    log.info(f"\n🔄 龙珠 7×24 守护进程 v2 启动")
+    log.info(f"   扫描间隔: {args.interval}s  每轮学习: {args.max_learn}个")
+    log.info(f"   " + orch.status_report().split('\n')[0])
 
-        round_num = daemon.rounds
+    round_num = 0
+    while running:
+        # ── 注入锁检查: 概念图批量注入运行时跳过本轮 ──
+        if os.path.exists(lock_path):
+            if not was_locked:
+                log.info("  ⏳ 概念图注入脚本运行中，暂停学习...")
+                was_locked = True
+            time.sleep(args.interval)
+            continue
+
+        # 锁刚释放 → 重载模型以获取注入结果
+        if was_locked:
+            try:
+                landscape = FreqEnergyLandscape.load(model_path)
+                orch = create_orchestrator_with_sequential(field, landscape, learner)
+                log.info("  🔄 模型已重载（注入完成）")
+            except Exception as e:
+                log.warning(f"  重载失败: {e}")
+            was_locked = False
+        round_num += 1
+        t0 = time.time()
+
+        # ★ 统一信号驱动循环
         try:
-            tick = orch.daemon_tick(round_num)
-
-            # 日志输出本轮引擎活动
-            if tick.get('pipeline', {}).get('acquired', 0) > 0:
-                p = tick['pipeline']
-                log.info(f"  📖 知识管线: 需求{p['demands_found']} "
-                        f"采集{p['acquired']} "
-                        f"注入{p['triples_added']}三元组 "
-                        f"{p.get('total_bigrams',0)}字对")
-
-            if tick.get('contra', {}).get('detected', 0) > 0:
-                c = tick['contra']
-                log.info(f"  ⚔️ 矛盾解: 检测{c['detected']} "
-                        f"消解{c.get('resolved',0)} "
-                        f"争议{c.get('kept_as_disputed',0)}")
-
-            if tick.get('fuzzy', {}).get('d_s_feedbacks', 0) > 0:
-                log.info(f"  🔄 模糊格: D-S回写{tick['fuzzy']['d_s_feedbacks']}条置信度")
-
-            if tick.get('plan', {}).get('targets', 0) > 0:
-                log.info(f"  📋 策应器: 规划{tick['plan']['targets']}个学习目标")
-
-            if tick.get('multiform', {}).get('total_form_knowledge', 0) > 0:
-                log.info(f"  📐 万象格: {tick['multiform']['total_form_knowledge']}条非三元组知识")
-
+            tick = orch.daemon_tick_v2(round_num)
         except Exception as e:
-            log.debug(f"  引擎调度异常: {e}")
+            log.warning(f"  守护循环异常: {e}")
+            tick = {}
 
-    daemon.run_round = enhanced_run_round
-    daemon.run_daemon(max_rounds=args.max_rounds)
+        elapsed = time.time() - t0
+
+        # 日志汇总
+        scanned = tick.get('scanned', 0)
+        injected = tick.get('pairs_injected', 0)
+        pending_resolved = tick.get('pending_resolved', 0)
+        sep_before = tick.get('separation_before', 0)
+        sep_after = tick.get('separation_after', 0)
+
+        if injected > 0 or pending_resolved > 0:
+            parts = [f"✅ 第{round_num}轮:"]
+            if pending_resolved > 0:
+                parts.append(f"插队解决{pending_resolved}")
+            if scanned > 0:
+                parts.append(f"扫描{scanned}盲区")
+            if injected > 0:
+                parts.append(f"注入{injected}字对 分离度{sep_before:.1f}→{sep_after:.1f}")
+            parts.append(f"({elapsed:.1f}s)")
+            log.info("  " + " ".join(parts))
+        else:
+            log.info(f"  💤 第{round_num}轮: 扫描{scanned}盲区 "
+                    f"未发现可学 ({elapsed:.1f}s)")
+
+        # 保存——只在真正学到新知识时保存
+        if injected > 0 or pending_resolved > 0:
+            try:
+                landscape.save(model_path)
+                # 概念图仅在有增量时保存（避免每轮写 257MB JSON 阻塞 WSL/I/O）
+                if (hasattr(orch.cg, 'save') and orch.cg.total_triples > 0
+                        and orch.cg._dirty_since_last_save):
+                    orch.cg.save(cg_path)
+                    orch.cg._dirty_since_last_save = False
+                log.info(f"  💾 模型已保存")
+            except Exception as e:
+                log.warning(f"  保存失败: {e}")
+
+        if args.max_rounds > 0 and round_num >= args.max_rounds:
+            log.info(f"\n✅ 完成 {args.max_rounds} 轮, 退出")
+            break
+
+        if running:
+            time.sleep(args.interval)
 
 
 # ============================================================================
@@ -691,13 +737,10 @@ def main():
                     correct += 1
         log.info(f"📊 检验: {correct}/{len(sample)} = {correct/len(sample)*100:.1f}%")
     elif args.once:
-        from scripts.auto_learn import AutoLearningDaemon
-        daemon = AutoLearningDaemon(scan_interval=9999, max_learn_per_round=args.max_learn,
-                                    factors=None, from_landscape=True)
-        daemon.field = field
-        daemon.landscape = landscape
-        daemon.learner = learner
-        daemon.run_round()
+        from loongpearl.core.orchestrator import create_orchestrator
+        orch = create_orchestrator(field, landscape, learner)
+        tick = orch.daemon_tick_v2(1)
+        log.info(f"单轮完成: {tick}")
     elif args.generate:
         from loongpearl.core.sequence_energy import SequenceEnergy
         seq = SequenceEnergy(field, landscape, device=DEVICE)

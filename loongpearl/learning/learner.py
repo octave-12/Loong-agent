@@ -870,19 +870,15 @@ class DragonBallLearner:
         n_anchors = len(anchors)
         n_known = len(pairs)
         
-        # 已知字对中点
-        mid_known = []
-        for ia, ib in pairs:
-            mid_known.append(((anchors[ia] + anchors[ib]) / 2).to(device))
-        mid_known = torch.stack(mid_known).detach()
+        # 已知字对中点 — 批量索引，一次GPU传输
+        idx_a = torch.tensor([p[0] for p in pairs])
+        idx_b = torch.tensor([p[1] for p in pairs])
+        mid_known = ((anchors[idx_a] + anchors[idx_b]) / 2).to(device).detach()
         
-        # 随机字对中点（负样本）
-        mid_random = []
-        for _ in range(n_known):
-            ia = _random.randint(0, n_anchors - 1)
-            ib = _random.randint(0, n_anchors - 1)
-            mid_random.append(((anchors[ia] + anchors[ib]) / 2).to(device))
-        mid_random = torch.stack(mid_random).detach()
+        # 随机字对中点（负样本）— 批量索引
+        rand_a = torch.randint(0, n_anchors, (n_known,))
+        rand_b = torch.randint(0, n_anchors, (n_known,))
+        mid_random = ((anchors[rand_a] + anchors[rand_b]) / 2).to(device).detach()
         
         with torch.no_grad():
             energy_known_before = self.landscape(mid_known).mean().item()
@@ -915,11 +911,13 @@ class DragonBallLearner:
             torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.05)
             optimizer.step()
         
-        # 单对 Hebbian 精细调节
-        for ia, ib in pairs:
-            vec_a = anchors[ia].detach().to(device)
-            vec_b = anchors[ib].detach().to(device)
-            self.hebbian.update(vec_a, vec_b, feedback=0.3)
+        # 批量 Hebbian 精细调节——仅在小批量时逐对执行
+        if n_known <= 100:
+            for ia, ib in pairs:
+                vec_a = anchors[ia].detach().to(device)
+                vec_b = anchors[ib].detach().to(device)
+                self.hebbian.update(vec_a, vec_b, feedback=0.3)
+        # 大批量时跳过逐对 Hebbian（对比学习已覆盖）
         
         with torch.no_grad():
             energy_known_after = self.landscape(mid_known).mean().item()
@@ -939,6 +937,49 @@ class DragonBallLearner:
             'separation_after': separation_after,
         }
     
+    def update_point(self, point_vec: torch.Tensor, target_energy: float) -> Dict:
+        """
+        对单个点进行能量调整（局部梯度下降）。
+        
+        用于序列臂训练：在锚点→目标字连线上的插值点建立能量梯度。
+        
+        Args:
+            point_vec: 目标点向量 (embed_dim,)
+            target_energy: 目标能量值
+        
+        Returns:
+            更新结果
+        """
+        device = next(self.landscape.parameters()).device
+        x = point_vec.detach().to(device)
+        
+        self.landscape.train()
+        optimizer = torch.optim.SGD(self.landscape.parameters(), lr=0.001)
+        
+        energy_before = 0.0
+        with torch.no_grad():
+            energy_before = self.landscape(x.unsqueeze(0)).item()
+        
+        target = torch.tensor([target_energy], device=device)
+        
+        for _ in range(3):
+            optimizer.zero_grad()
+            current_energy = self.landscape(x.unsqueeze(0)).squeeze(-1)
+            loss = torch.nn.functional.mse_loss(current_energy, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.1)
+            optimizer.step()
+        
+        with torch.no_grad():
+            energy_after = self.landscape(x.unsqueeze(0)).item()
+        
+        return {
+            'status': 'updated',
+            'energy_before': energy_before,
+            'energy_after': energy_after,
+            'delta': energy_after - energy_before,
+        }
+
     def unlearn_chars(
         self,
         query_char: str,

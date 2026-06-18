@@ -405,6 +405,12 @@ class ConceptGraph:
         # ── 持久化路径 ──
         self._data_dir = None
 
+        # ── 写入脏标记: 避免每轮无变化时仍写 257MB JSON ──
+        self._dirty_since_last_save = False
+
+        # ── 字符邻接索引: char → {neighbor_chars}，O(1)查询盲区关联 ──
+        self._char_adjacency: Dict[str, set] = defaultdict(set)
+
     # ═══════════════════════════════════════════════════════════════════════
     # 节点管理
     # ═══════════════════════════════════════════════════════════════════════
@@ -563,6 +569,13 @@ class ConceptGraph:
         self.reverse_index[obj][subject] = relation
 
         self.total_triples += 1
+        self._dirty_since_last_save = True
+
+        # ── 字符邻接索引: 单字概念 → 快速查找关联字 ──
+        if len(subject) == 1 and len(obj) == 1:
+            self._char_adjacency[subject].add(obj)
+            self._char_adjacency[obj].add(subject)
+
         return triple
 
     def add_triples_batch(
@@ -587,6 +600,36 @@ class ConceptGraph:
             if self.add_triple(s, r, o, confidence=confidence, source=source):
                 count += 1
         return count
+
+    def get_char_pairs(self, char: str, max_pairs: int = 200) -> list:
+        """O(1) 查询与指定汉字关联的所有字符（用于盲区快速填坑）。
+        
+        Args:
+            char: 单个汉字
+            max_pairs: 返回上限
+        
+        Returns:
+            [(ia, ib), ...] 字对索引列表
+        """
+        neighbors = self._char_adjacency.get(char, set())
+        if not neighbors:
+            return []
+        
+        pairs = []
+        seen = set()
+        for other in neighbors:
+            if len(pairs) >= max_pairs:
+                break
+            if other == char:
+                continue
+            ia = self.zichang._char_to_idx.get(char)
+            ib = self.zichang._char_to_idx.get(other)
+            if ia is not None and ib is not None:
+                key = (min(ia, ib), max(ia, ib))
+                if key not in seen:
+                    seen.add(key)
+                    pairs.append((ia, ib))
+        return pairs
 
     # ═══════════════════════════════════════════════════════════════════════
     # 知识提取 — 从搜索文本中挖掘三元组
@@ -1489,47 +1532,37 @@ class ConceptGraph:
         min_confidence: float = 0.6,
         max_pairs: int = 200,
         learning_rate: float = 0.02,
-    ) -> int:
+    ) -> List[Tuple[int, int]]:
         """
-        将概念图中的高置信度三元组对齐到能量景观。
-
-        原理: 对高置信度的 (A, relation, B)，将 A 和 B 的嵌入中点
-        写入能量景观作为低能盆地，使景观与概念图知识一致。
+        ★ 写入权归大脑: 不再直接调用 learner.learn_pairs_batch。
+        改为返回高置信度三元组的字对列表, orchestrator 统一注入。
 
         Args:
-            learner: DragonBallLearner 实例 (含 learn_pairs_batch)
+            learner: (保留参数兼容, 不再使用)
             min_confidence: 最低置信度
-            max_pairs: 最大训练对数
-            learning_rate: Hebbian 学习率
+            max_pairs: 最大字对数
+            learning_rate: (保留参数兼容)
 
         Returns:
-            训练的对数
+            [(ia, ib), ...] 字对索引列表
         """
-        if learner is None or self.landscape is None:
-            return 0
+        if self.landscape is None:
+            return []
 
-        # 收集高置信度三元组的字对
         pairs = []
         for triple in self.triples.values():
             if triple.confidence < min_confidence:
                 continue
-            # 分解概念为汉字
             chars_a = list(triple.subject)
             chars_b = list(triple.object)
-            # 取每个概念的首字和尾字作为锚点对
-            for ca in chars_a[:2]:  # 最多取前2字
+            for ca in chars_a[:2]:
                 for cb in chars_b[:2]:
                     ia = getattr(self.zichang, '_char_to_idx', {}).get(ca)
                     ib = getattr(self.zichang, '_char_to_idx', {}).get(cb)
                     if ia is not None and ib is not None:
                         pairs.append((ia, ib))
 
-        if not pairs:
-            return 0
-
-        pairs = pairs[:max_pairs]
-        learner.learn_pairs_batch(pairs, learning_rate=learning_rate)
-        return len(pairs)
+        return pairs[:max_pairs]
 
     # ═══════════════════════════════════════════════════════════════════════
     # 统计
@@ -1593,7 +1626,8 @@ class ConceptGraph:
         with open(base + '.json', 'w', encoding='utf-8') as f:
             json.dump(graph_data, f, ensure_ascii=False, indent=2)
 
-        self._data_dir = os.path.dirname(base)
+        self._data_dir = os.path.dirname(base) if os.path.dirname(base) else '.'
+        self._dirty_since_last_save = False
         print(f"概念图已保存: {base}.json" + (" + {base}_embeds.pt" if save_embeds else ""))
 
     def load(self, path: str):
@@ -1622,6 +1656,7 @@ class ConceptGraph:
             self.triples.clear()
             self.forward_index.clear()
             self.reverse_index.clear()
+            self._char_adjacency.clear()
             self.total_triples = 0
             self.total_inferred = graph_data.get('total_inferred', 0)
             self.node_aliases = graph_data.get('aliases', {})
@@ -1635,6 +1670,7 @@ class ConceptGraph:
                 )
 
         self._data_dir = os.path.dirname(base) if os.path.dirname(base) else '.'
+        self._dirty_since_last_save = False
         print(f"概念图已加载: {len(self.nodes)}节点 {self.total_triples}三元组")
 
     @classmethod
