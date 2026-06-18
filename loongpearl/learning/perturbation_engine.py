@@ -201,8 +201,11 @@ class PerturbationEngine:
         # 相似度矩阵 (2000×2000, ~4M entries, GPU ~5ms)
         sim_matrix = subset_norm @ subset_norm.T
         
-        # 上三角 (排除自对)
-        triu_idx = torch.triu_indices(self.N_SUBSET, self.N_SUBSET, offset=1)
+        # 上三角 (排除自对) — 索引必须在同一设备
+        triu_idx = torch.triu_indices(
+            self.N_SUBSET, self.N_SUBSET, offset=1,
+            device=self.device
+        )
         triu_sims = sim_matrix[triu_idx[0], triu_idx[1]]
         
         # 取最低相似度的百分位 → 远距对
@@ -221,13 +224,14 @@ class PerturbationEngine:
         # 随机采样 n_pairs
         n_available = distant_pairs.shape[1]
         n_sample = min(self.N_DISTANT_PAIRS, n_available)
-        sample_idx = torch.randperm(n_available)[:n_sample]
+        sample_idx = torch.randperm(n_available, device=self.device)[:n_sample]
         distant_pairs = distant_pairs[:, sample_idx]
         distant_sims = distant_sims[sample_idx]
         
-        # 映射回全局索引 (CPU tensors)
-        global_a = subset_idx[distant_pairs[0]]
-        global_b = subset_idx[distant_pairs[1]]
+        # 映射回全局索引 → 移到 CPU 索引 CPU 的 subset_idx
+        dp_cpu = distant_pairs.cpu()
+        global_a = subset_idx[dp_cpu[0]]
+        global_b = subset_idx[dp_cpu[1]]
         pair_indices = torch.stack([global_a, global_b], dim=1)
         
         # 中点向量 — 索引移到 GPU 再索引锚点
