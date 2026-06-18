@@ -818,7 +818,7 @@ class HanziAnchorField:
             # cosine_similarity(x1, x2, dim=1): x1(N,D) × x2(M,D) -> (N,M)
             similarities = torch.cosine_similarity(
                 query_vec.float(),  # (1, D)
-                self.anchors,       # (N, D)
+                self.anchors.float(),
                 dim=1               # -> (N,)
             )
             
@@ -884,7 +884,70 @@ class HanziAnchorField:
         if not vectors:
             return torch.empty(0, self.embed_dim)
         return torch.stack(vectors)
-    
+
+    def encode_sequence(self, chars: List[str], direction: str = 'forward',
+                        word_lexicon: set = None) -> torch.Tensor:
+        """
+        位置感知序列编码 —— 保留语序信息。
+
+        解决均值池化"量子纠缠=纠缠量子"的问题：
+        - 越靠后的字权重越高（诗句补全时尾字最重要）
+        - 可选词级锚点语义补充（已知双字词向量融合）
+
+        Args:
+            chars: 汉字字符列表
+            direction: 'forward'（尾字高权重）或 'backward'（首字高权重）
+            word_lexicon: 可选，已知词的集合，用于词级锚点补充
+
+        Returns:
+            编码向量 (embed_dim,)
+        """
+        if self.anchors is None:
+            raise RuntimeError("字场尚未构建")
+
+        n = len(chars)
+        if n == 0:
+            return torch.zeros(self.embed_dim)
+
+        # 1. 获取字符嵌入
+        vecs = []
+        valid_indices = []
+        for i, ch in enumerate(chars):
+            idx = self._char_to_idx.get(ch)
+            if idx is not None:
+                vecs.append(self.anchors[idx])
+                valid_indices.append(i)
+        if not vecs:
+            return torch.zeros(self.embed_dim)
+
+        stacked = torch.stack(vecs)  # (M, embed_dim)
+        m = len(vecs)
+
+        # 2. 位置权重：指数衰减，尾字主导
+        if direction == 'forward':
+            raw_weights = torch.tensor([3.0 ** (i / max(m - 1, 1)) for i in range(m)])
+        else:
+            raw_weights = torch.tensor([3.0 ** ((m - 1 - i) / max(m - 1, 1)) for i in range(m)])
+        weights = raw_weights / raw_weights.sum()
+
+        char_vec = (stacked * weights.unsqueeze(-1)).sum(dim=0)  # (embed_dim,)
+
+        # 3. 词锚点语义补充
+        if word_lexicon and n >= 2:
+            word_vecs = []
+            for i in range(n - 1):
+                bigram = chars[i] + chars[i + 1]
+                if bigram in word_lexicon:
+                    idx_a = self._char_to_idx.get(chars[i])
+                    idx_b = self._char_to_idx.get(chars[i + 1])
+                    if idx_a is not None and idx_b is not None:
+                        word_vecs.append((self.anchors[idx_a] + self.anchors[idx_b]) / 2)
+            if word_vecs:
+                word_avg = torch.stack(word_vecs).mean(dim=0)
+                char_vec = 0.6 * char_vec + 0.4 * word_avg  # 字60% + 词40%
+
+        return char_vec
+
     def expand_energy(
         self,
         seed_vec: torch.Tensor,

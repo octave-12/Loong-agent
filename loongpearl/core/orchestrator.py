@@ -410,6 +410,122 @@ class Orchestrator:
     # ★ 新版: 五步信号驱动推理管道
     # ═══════════════════════════════════════════════════════════════════
 
+    # ── 查询路由: 问题分类 + 路径选择 ──
+
+    _FACTUAL_KEYWORDS = ['是什么', '什么是', '定义', '属于', '称作', '叫做',
+                         '是不是', '是.*吗', '分类', '类别', '物种']
+    _SEQUENTIAL_KEYWORDS = ['下一句', '下一字', '下一首', '补全', '接龙',
+                            '后面.*什么', '接着.*什么']
+    _RELATIONAL_KEYWORDS = ['区别', '不同', '差异', '相似', '相同', '比较',
+                            '相比', 'vs', '对比', '关系']
+
+    def _classify_query(self, text: str, frame) -> str:
+        """分类查询类型: factual / sequential / relational / uncertain"""
+        text_lower = text.lower()
+
+        # 序列类: 查询含 "_" 或下划线（补全标记）→ sequential
+        if '_' in text or '＿' in text or '___' in text:
+            return 'sequential'
+
+        # 关键词匹配
+        for kw in self._SEQUENTIAL_KEYWORDS:
+            if re.search(kw, text):
+                return 'sequential'
+
+        for kw in self._FACTUAL_KEYWORDS:
+            if re.search(kw, text):
+                return 'factual'
+
+        for kw in self._RELATIONAL_KEYWORDS:
+            if re.search(kw, text):
+                return 'relational'
+
+        # 帧类型辅助判断
+        if frame and frame.question_type:
+            qt = frame.question_type.name
+            if qt in ('DEFINE', 'CHECK_TRUTH', 'YES_NO'):
+                return 'factual'
+            if qt in ('COMPARE', 'FIND_PATH'):
+                return 'relational'
+
+        return 'uncertain'
+
+    def _route_query(self, text: str, query_chars: list,
+                     query_vec: torch.Tensor, frame) -> Dict:
+        """
+        查询路由: 根据问题类型选择主路径。
+
+        Returns:
+            {'path': str, 'result': dict | None, 'fallback': bool}
+            path ∈ {'concept_graph', 'poetic_next', 'energy_landscape', 'fuzzy_fusion'}
+        """
+        qtype = self._classify_query(text, frame)
+
+        if qtype == 'factual':
+            return self._route_factual(text, query_chars)
+        elif qtype == 'sequential':
+            return self._route_sequential(text, query_chars, query_vec)
+        elif qtype == 'relational':
+            return {'path': 'energy_landscape', 'result': None, 'fallback': False}
+        else:
+            return {'path': 'fuzzy_fusion', 'result': None, 'fallback': False}
+
+    def _route_factual(self, text: str, query_chars: list) -> Dict:
+        """事实类查询: 概念图 IS_A / DEFINED_AS 优先"""
+        result = {'path': 'concept_graph', 'result': None, 'fallback': False}
+
+        for ch in query_chars[:5]:
+            triples = self._get_triples_for(ch)
+            for rel, obj, conf, src in triples:
+                if rel in ('IS_A', 'DEFINED_AS') and conf > 0.3:
+                    if not result['result']:
+                        result['result'] = []
+                    result['result'].append({
+                        'subject': ch, 'relation': rel,
+                        'object': obj, 'confidence': conf
+                    })
+
+        # 概念图无结果 → 回退到能量景观
+        if not result['result']:
+            result['path'] = 'energy_landscape'
+            result['fallback'] = True
+
+        return result
+
+    def _route_sequential(self, text: str, query_chars: list,
+                          query_vec: torch.Tensor) -> Dict:
+        """序列类查询: 概念图 POETIC_NEXT 优先"""
+        result = {'path': 'poetic_next', 'result': None, 'fallback': False}
+
+        # 取最后一个汉字作为锚点
+        last_char = query_chars[-1] if query_chars else ''
+        if not last_char:
+            result['fallback'] = True
+            return result
+
+        # 查概念图 POETIC_NEXT: 锚点的下一个字
+        next_chars = []
+        triples = self._get_triples_for(last_char)
+        for rel, obj, conf, src in triples:
+            if rel == 'POETIC_NEXT' and conf > 0.01 and len(obj) == 1:
+                next_chars.append((obj, conf))
+
+        # 按置信度排序
+        next_chars.sort(key=lambda x: -x[1])
+
+        if next_chars:
+            result['result'] = {
+                'anchor': last_char,
+                'candidates': next_chars[:10],
+                'source': 'concept_graph'
+            }
+            return result
+
+        # 概念图无 POETIC_NEXT → 回退到能量景观梯度下降
+        result['path'] = 'energy_landscape'
+        result['fallback'] = True
+        return result
+
     def query(self, question_text: str) -> Dict[str, Any]:
         """
         五步信号驱动推理 — 龙珠核心管道。
@@ -466,17 +582,18 @@ class Orchestrator:
             })
             return result
 
-        # 查询向量 = 关键汉字的锚点嵌入均值
+        # 查询向量 = 位置感知序列编码（保留语序）
+        # 构建词库：从概念图提取已知双字词
+        word_lexicon = None
+        if hasattr(self, 'cg') and hasattr(self.cg, 'forward_index'):
+            word_lexicon = {s for s in self.cg.forward_index.keys()
+                          if len(s) == 2 and '\u4e00' <= s[0] <= '\u9fff'
+                          and '\u4e00' <= s[1] <= '\u9fff'}
+
         if query_chars:
-            device = next(self.landscape.parameters()).device
-            vecs = []
-            for ch in query_chars[:10]:
-                idx = self.field._char_to_idx.get(ch)
-                if idx is not None:
-                    vecs.append(self.field.anchors[idx].to(device))
-            if not vecs:
-                vecs = [self.field.anchors[0].to(device)]  # 兜底
-            query_vec = torch.stack(vecs).mean(dim=0)
+            query_vec = self.field.encode_sequence(
+                query_chars, direction='forward', word_lexicon=word_lexicon
+            )
             result['debug']['query_chars'] = query_chars[:5]
         else:
             # 无汉字但非计算类: 使用零向量兜底
@@ -505,6 +622,41 @@ class Orchestrator:
                 question_text, result, source="creative"
             )
             return result
+
+        # ── ★ 查询路由: 根据问题类型选择推理路径 ──
+        route = self._route_query(question_text, query_chars, query_vec, frame)
+        result['debug']['route'] = {
+            'path': route['path'],
+            'fallback': route.get('fallback', False),
+            'qtype': self._classify_query(question_text, frame),
+        }
+
+        # 概念图直达 → 跳过能量推理
+        if route['path'] == 'concept_graph' and route.get('result') and not route.get('fallback'):
+            cg_result = route['result']
+            facts = [{'relation': r['relation'], 'object': r['object'],
+                      'subject': r['subject'], 'confidence': r['confidence']}
+                     for r in cg_result[:5]]
+            result['answer'] = self.decoder.render({
+                'render_type': 'list_related',
+                'subject': question_text,
+                'facts': facts,
+            })
+            result['signal'] = 'certain'
+            result['confidence'] = max(r['confidence'] for r in cg_result[:5]) if cg_result else 0.3
+            return result
+
+        # 序列补全 → POETIC_NEXT 直达
+        if route['path'] == 'poetic_next' and route.get('result') and not route.get('fallback'):
+            seq_result = route['result']
+            candidates = seq_result['candidates']
+            if candidates:
+                top = candidates[0]
+                result['answer'] = f"「{seq_result['anchor']}」后最常接「{top[0]}」(置信度 {top[1]:.3f})"
+                result['signal'] = 'certain'
+                result['confidence'] = top[1]
+                result['debug']['next_chars'] = candidates[:5]
+                return result
 
         # ── 第三步: 能量景观梯度下降推理 ──
         infer_result = self.landscape.infer(
