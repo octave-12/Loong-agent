@@ -1683,22 +1683,15 @@ class Orchestrator:
         return unique[:200]
 
     def _build_search_queries(self, char: str, factor: str) -> list:
-        """根据盲区因子构造多查询策略"""
-        if factor == 'dead_end':
-            return [f"{char}字开头的成语有哪些", f"{char}成语大全"]
-        elif factor == 'gradient':
-            return [f"{char} 成语 释义", f"{char}字 组词 常见词语",
-                    f"含有{char}字的词语 成语"]
-        elif factor == 'semantic':
-            return [f"{char} 组词 成语 搭配"]
-        elif factor == 'statistical':
-            return [f"{char} 成语接龙", f"{char}字 常见词语"]
-        elif factor == 'coverage':
-            return [f"{char} 成语 用法 释义", f"{char} 组词"]
-        elif factor == 'freshness':
-            return [f"{char}字 组词 新词语"]
-        else:
-            return [f"{char} 组词 成语 搭配"]
+        """根据盲区因子构造多查询策略 — v3: 委托 policy_query 模块"""
+        try:
+            from loongpearl.core.policy_query import build_search_strategy
+            strategy = build_search_strategy(factor, char)
+            return strategy.queries
+        except Exception:
+            pass
+        # 回退（模块未加载时）
+        return [f"{char} 组词 成语 搭配"]
 
     # ── 定期调度方法 v2 (修复 API 断裂: triples.keys → forward_index) ──
 
