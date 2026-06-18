@@ -1561,7 +1561,7 @@ class Orchestrator:
                         'fragility': round(pert_report.fragility_score, 3),
                     }
             except Exception as e:
-                log.debug(f"  扰动引擎异常: {e}")
+                log.warning(f"  扰动引擎异常: {e}")
             try:
                 ds_report = self.ds_generator.run()
                 if ds_report.n_injected > 0:
@@ -1570,7 +1570,7 @@ class Orchestrator:
                         'injected': ds_report.n_injected,
                     }
             except Exception as e:
-                log.debug(f"  D-S生成异常: {e}")
+                log.warning(f"  D-S生成异常: {e}")
         
         # 每轮: 衰减
         try:
@@ -1643,7 +1643,7 @@ class Orchestrator:
                         'injected': gr_report.n_injected,
                     }
             except Exception as e:
-                log.debug(f"  梯度反推异常: {e}")
+                log.warning(f"  梯度反推异常: {e}")
 
         # 每50轮: EWC Fisher更新 + 锚定参数采样
         if round_num % 50 == 0 and self.learner and hasattr(self.learner, 'update_ewc_fisher'):

@@ -225,14 +225,15 @@ class PerturbationEngine:
         distant_pairs = distant_pairs[:, sample_idx]
         distant_sims = distant_sims[sample_idx]
         
-        # 映射回全局索引
+        # 映射回全局索引 (CPU tensors)
         global_a = subset_idx[distant_pairs[0]]
         global_b = subset_idx[distant_pairs[1]]
         pair_indices = torch.stack([global_a, global_b], dim=1)
         
-        # 中点向量 (L2归一化)
+        # 中点向量 — 索引移到 GPU 再索引锚点
         midpoints = F.normalize(
-            (anchors[global_a] + anchors[global_b]) / 2,
+            (anchors[global_a.to(self.device)] + 
+             anchors[global_b.to(self.device)]) / 2,
             p=2, dim=1,
         )
         

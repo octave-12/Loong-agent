@@ -243,11 +243,10 @@ class DSHypothesisGenerator:
             return hypotheses
         
         sub = anchors[:search_range].to(self.device)
+        sub_norm = F.normalize(sub, p=2, dim=1)
         
-        # GPU 单次全矩阵 (N, D) → (N, N)
-        sim_matrix = F.cosine_similarity(
-            sub.unsqueeze(1), sub.unsqueeze(0), dim=2
-        )
+        # GPU 矩阵乘法 (N,D)×(D,N)→(N,N), ~100MB, ~2ms
+        sim_matrix = sub_norm @ sub_norm.T
         
         # 已有边集合 (双向)
         existing = set()
