@@ -487,6 +487,7 @@ class CoverageFactor(FactorDetector):
     def __init__(self, field, landscape, idioms=None, from_landscape=False):
         super().__init__('coverage', field, landscape, idioms,
                         priority_weight=0.9, from_landscape=from_landscape)
+        self.sample_targets = 200  # ★ 景观模式采样目标数
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
         t0 = time.time()
@@ -540,6 +541,7 @@ class CoverageFactor(FactorDetector):
     
     def _scan_landscape_mode(self) -> List[BlindSpot]:
         """景观模式: 能量连接广度 → 覆盖盲区"""
+        t0 = time.time()
         active_chars = [c for c in self.ci.keys()]
         if len(active_chars) > 5000:
             active_chars = active_chars[:5000]
