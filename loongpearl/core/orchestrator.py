@@ -1603,7 +1603,7 @@ class Orchestrator:
                 self.field, self.landscape, None,
                 num_partitions=8, from_landscape=True,
             )
-        self._detector.scan_all(parallel=False)
+        self._detector.scan_all(parallel=True)
         return self._detector.top_gaps(100)
 
     # ── 双臂搜索 ──

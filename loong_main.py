@@ -471,7 +471,7 @@ def run_daemon(field, landscape, learner, args):
         # 锁刚释放 → 重载模型以获取注入结果
         if was_locked:
             try:
-                landscape = FreqEnergyLandscape.load(model_path)
+                landscape = FreqEnergyLandscape.load(model_path).to(DEVICE)
                 orch = create_orchestrator_with_sequential(field, landscape, learner)
                 log.info("  🔄 模型已重载（注入完成）")
             except Exception as e:

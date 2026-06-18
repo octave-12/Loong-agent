@@ -918,13 +918,45 @@ class DragonBallLearner:
             torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.05)
             optimizer.step()
         
-        # 批量 Hebbian 精细调节——仅在小批量时逐对执行
-        if n_known <= 100:
+        # 批量 Hebbian 精细调节 —— 批量化替代逐对循环
+        # 原理: N个字符对的插值点合并为一个大batch，5步SGD一次完成
+        if n_known <= 200:  # 扩大阈值：批量化后200对也无压力
+            import torch.nn.functional as F2
+            # 批量插值: 每对生成 n_points 个插值点 → (N * n_points, 1024)
+            n_points = self.hebbian.n_points if hasattr(self.hebbian, 'n_points') else 8
+            alphas = torch.linspace(0.1, 0.9, n_points, device=device)
+            
+            # 批量锚点: (N, 1024)
+            batch_a = anchors[idx_a].detach().to(device)
+            batch_b = anchors[idx_b].detach().to(device)
+            
+            # 批量插值: (N, n_points, 1024) → (N * n_points, 1024)
+            interp = batch_a.unsqueeze(1) * (1 - alphas).view(1, -1, 1) + \
+                     batch_b.unsqueeze(1) * alphas.view(1, -1, 1)
+            interp = interp.reshape(-1, interp.shape[-1])
+            interp = F2.normalize(interp, p=2, dim=1)
+            
+            # 加噪声
+            noise = torch.randn_like(interp) * self.hebbian.local_radius
+            targets_hebb = F2.normalize(interp + noise, p=2, dim=1)
+            
+            # 5步SGD批量降低插值路径能量
+            hebb_lr = self.hebbian.lr * 0.3  # feedback=0.3
+            hebb_opt = torch.optim.SGD(self.landscape.parameters(), lr=hebb_lr)
+            target_shift = -0.3 * 0.5  # -feedback * 0.5
+            
+            for _ in range(5):
+                hebb_opt.zero_grad()
+                curr_e = self.landscape(targets_hebb)
+                loss = F2.mse_loss(curr_e, curr_e.detach() + target_shift)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.landscape.parameters(), 0.1)
+                hebb_opt.step()
+            
+            # 记录激活 (仅记录字符索引，不做逐对SGD)
             for ia, ib in pairs:
-                vec_a = anchors[ia].detach().to(device)
-                vec_b = anchors[ib].detach().to(device)
-                self.hebbian.update(vec_a, vec_b, feedback=0.3)
-        # 大批量时跳过逐对 Hebbian（对比学习已覆盖）
+                self.hebbian.tracker.record(torch.tensor([ia, ib]))
+        # 超大批量时跳过 Hebbian（对比学习已覆盖）
         
         with torch.no_grad():
             energy_known_after = self.landscape(mid_known).mean().item()

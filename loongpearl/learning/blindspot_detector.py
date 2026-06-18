@@ -401,6 +401,9 @@ class EnergyFactor(FactorDetector):
         num_anchors = len(anchors)
         batch_size = 200  # 每批200个尾字
         
+        # 两阶段: 先收集所有 min_energy，再数据驱动阈值（替代硬编码 -5.0）
+        all_results = []  # (char, min_e, mean_e)
+        
         with torch.no_grad():
             for i in range(0, len(active_chars), batch_size):
                 batch_chars = active_chars[i:i + batch_size]
@@ -428,26 +431,38 @@ class EnergyFactor(FactorDetector):
                     all_energies.append(e)
                 
                 energies = torch.cat(all_energies).reshape(B, S)
-                min_energies = energies.min(dim=1).values  # 每个尾字的最小能量
-                mean_energies = energies.mean(dim=1)       # 平均能量
+                min_energies = energies.min(dim=1).values
+                mean_energies = energies.mean(dim=1)
                 
                 for j, ch in enumerate(batch_chars):
-                    min_e = min_energies[j].item()
-                    mean_e = mean_energies[j].item()
-                    
-                    # 盲区: 最小能量 > -5 (缺乏深盆地连接)
-                    if min_e > -5.0:
-                        gap_score = (min_e + 5.0) * 2 + (mean_e - min_e)
-                        gaps.append(BlindSpot(
-                            priority=-gap_score,
-                            char=ch,
-                            factor=self.name,
-                            score=gap_score,
-                            evidence={
-                                'min_energy': min_e,
-                                'mean_energy': mean_e,
-                            }
-                        ))
+                    all_results.append((ch, min_energies[j].item(), mean_energies[j].item()))
+        
+        # 数据驱动阈值: 取 min_energy 的 P75 百分位（能量最高的 25% 是盲区）
+        if all_results:
+            min_vals = sorted([r[1] for r in all_results])
+            n = len(min_vals)
+            threshold = min_vals[int(n * 0.75)]  # P75
+            # 确保阈值至少高于全局均值+0.5σ，避免琐碎盲区
+            import numpy as np
+            arr = np.array(min_vals)
+            floor = arr.mean() + 0.5 * arr.std()
+            threshold = max(threshold, floor)
+            
+            for ch, min_e, mean_e in all_results:
+                if min_e > threshold:
+                    # 得分: 与阈值的相对距离 + 能量波动
+                    gap_score = (min_e - threshold) * 2 + (mean_e - min_e)
+                    gaps.append(BlindSpot(
+                        priority=-gap_score,
+                        char=ch,
+                        factor=self.name,
+                        score=gap_score,
+                        evidence={
+                            'min_energy': min_e,
+                            'mean_energy': mean_e,
+                            'threshold': threshold,
+                        }
+                    ))
         
         self._last_scan_time = time.time() - t0
         return gaps
@@ -459,14 +474,14 @@ class EnergyFactor(FactorDetector):
 
 class CoverageFactor(FactorDetector):
     """
-    覆盖盲区: 汉字在成语词典中的出现次数太少或角色单一。
+    覆盖盲区: 检测某字在能量景观中的连接广度。
     
-    如果一个字只作为首字出现、或只作为尾字出现，
-    说明龙珠只知道它的一种用法——需要学习其他用法。
+    景观模式 (from_landscape=True):
+      对每个字采样N个随机目标字，统计低能连接数。
+      连接数少的字 = 覆盖盲区 = 该字只"认识"少数其他字。
     
-    注: 此因子依赖 idioms.json 统计角色分布，from_landscape 模式下
-    跳过扫描(返回空结果)。覆盖检测本质上是词典统计问题，
-    能量景观本身不编码位置角色信息。
+    传统模式 (from_landscape=False):
+      使用 idioms.json 统计角色分布。
     """
     
     def __init__(self, field, landscape, idioms=None, from_landscape=False):
@@ -474,14 +489,13 @@ class CoverageFactor(FactorDetector):
                         priority_weight=0.9, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
-        if self.from_landscape:
-            # 覆盖检测依赖成语词典的角色统计，景观模式跳过
-            self._last_scan_time = 0.0
-            return []
-        
         t0 = time.time()
         
-        # 统计每个字的角色分布
+        if self.from_landscape:
+            # 景观模式: 用能量连接广度替代角色分布
+            return self._scan_landscape_mode()
+        
+        # 传统模式: 统计角色分布
         char_roles = defaultdict(lambda: {'head': 0, 'tail': 0, 'mid': 0, 'total': 0})
         
         for w in self.idioms:
@@ -500,17 +514,15 @@ class CoverageFactor(FactorDetector):
         for ch, roles in char_roles.items():
             total = roles['total']
             if total < 2:
-                continue  # 出现次数太少，暂不处理
+                continue
             
-            # 计算角色多样性
-            # 如果只有一个角色占比>80% → 单一用法
             max_role = max(roles['head'], roles['tail'], roles['mid'])
             ratio = max_role / max(total, 1)
             
             if ratio > 0.8 and total >= 3:
                 dominant = 'head' if roles['head'] == max_role else \
                            'tail' if roles['tail'] == max_role else 'mid'
-                gap_score = ratio * total  # 盲区度 = 单角色比例 × 总次数
+                gap_score = ratio * total
                 gaps.append(BlindSpot(
                     priority=-gap_score,
                     char=ch,
@@ -520,6 +532,91 @@ class CoverageFactor(FactorDetector):
                         'roles': dict(roles),
                         'dominant_role': dominant,
                         'ratio': ratio,
+                    }
+                ))
+        
+        self._last_scan_time = time.time() - t0
+        return gaps
+    
+    def _scan_landscape_mode(self) -> List[BlindSpot]:
+        """景观模式: 能量连接广度 → 覆盖盲区"""
+        active_chars = [c for c in self.ci.keys()]
+        if len(active_chars) > 5000:
+            active_chars = active_chars[:5000]
+        if not active_chars:
+            return []
+        
+        anchors = self.field.anchors.to(self.device)
+        num_anchors = len(anchors)
+        sample_targets = self.sample_targets
+        batch_size = 200
+        
+        all_results = []  # (char, low_energy_count, mean_energy)
+        
+        with torch.no_grad():
+            for i in range(0, len(active_chars), batch_size):
+                batch_chars = active_chars[i:i + batch_size]
+                src_indices = [self.ci[c] for c in batch_chars]
+                src = anchors[torch.tensor(src_indices, device=self.device)]
+                
+                tgt_indices = torch.randint(0, num_anchors, (sample_targets,), device=self.device)
+                tgt = anchors[tgt_indices]
+                
+                B = len(batch_chars)
+                S = sample_targets
+                chunk = 500
+                all_energies = []
+                for j in range(0, B * S, chunk):
+                    end = min(j + chunk, B * S)
+                    bi = torch.arange(j, end, device=self.device) // S
+                    si = torch.arange(j, end, device=self.device) % S
+                    mids = (src[bi] + tgt[si]) / 2
+                    e = self.landscape(mids).squeeze(-1)
+                    all_energies.append(e)
+                
+                energies = torch.cat(all_energies).reshape(B, S)
+                
+                # 低能连接: 能量低于全局 P25
+                for j, ch in enumerate(batch_chars):
+                    e_row = energies[j]
+                    all_results.append((ch, e_row))
+        
+        if not all_results:
+            return []
+        
+        # 数据驱动: 统计每个字的"低能连接数"
+        import numpy as np
+        # 将所有能量值收集到 CPU numpy 数组
+        all_e_np = torch.cat([r[1].cpu() for r in all_results]).numpy()
+        low_threshold = float(np.percentile(all_e_np, 25))
+        
+        char_stats = []
+        for ch, e_row in all_results:
+            e_np = e_row.cpu().numpy()
+            low_count = int((e_np < low_threshold).sum())
+            mean_e = float(e_np.mean())
+            char_stats.append((ch, low_count, mean_e))
+        
+        # 连接数最少的 30% = 覆盖盲区（放宽阈值）
+        counts = sorted([s[1] for s in char_stats])
+        n = len(counts)
+        count_threshold = counts[int(n * 0.30)]
+        
+        gaps = []
+        for ch, low_count, mean_e in char_stats:
+            if low_count <= count_threshold:
+                coverage_ratio = max(0, 1 - low_count / max(count_threshold + 1, 1))
+                gap_score = coverage_ratio * 10 + max(0, mean_e + 150) / 10
+                gaps.append(BlindSpot(
+                    priority=-gap_score,
+                    char=ch,
+                    factor=self.name,
+                    score=gap_score,
+                    evidence={
+                        'low_energy_connections': low_count,
+                        'sample_targets': sample_targets,
+                        'coverage_ratio': round(coverage_ratio, 3),
+                        'mean_energy': round(mean_e, 2),
                     }
                 ))
         
@@ -696,22 +793,31 @@ class GradientFactor(FactorDetector):
         self.calibrated = True
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
+        # 景观模式: 扫描字场中所有字符（或随机采样）
         if not self.calibrated:
             self.calibrate()
         
         t0 = time.time()
         gaps = []
         
-        # 只扫描在成语中出现的字(它们应该有良好训练的梯度)
-        active_chars = set()
-        for w in self.idioms:
-            if len(w) == 4:
-                for c in w:
-                    active_chars.add(c)
-        active_chars = [c for c in active_chars if c in self.ci]
+        # 字符池: 景观模式用全部字场字符，传统模式从成语中取
+        if self.idioms is not None:
+            active_chars = set()
+            for w in self.idioms:
+                if len(w) == 4:
+                    for c in w:
+                        active_chars.add(c)
+            active_chars = [c for c in active_chars if c in self.ci]
+        else:
+            active_chars = [c for c in self.ci.keys()]
+        
+        # 限制检测量: 随机采样500个
+        import random as _random
+        if len(active_chars) > 500:
+            active_chars = _random.sample(active_chars, 500)
         
         self.landscape.train()
-        for ch in active_chars[:500]:  # 限制检测量
+        for ch in active_chars:
             idx = self.ci[ch]
             x = self.field.anchors[idx].clone().detach().to(self.device)
             x.requires_grad_(True)
@@ -720,7 +826,7 @@ class GradientFactor(FactorDetector):
             grad_norm = x.grad.norm().item()
             
             z = abs(grad_norm - self.grad_mean) / max(self.grad_std, 1e-6)
-            if z > 4.0:  # 梯度异常偏离(>4σ)
+            if z > 2.5:  # 梯度异常偏离(>2.5σ)
                 gap_score = z
                 gaps.append(BlindSpot(
                     priority=-gap_score,
@@ -755,24 +861,32 @@ class SemanticGapFactor(FactorDetector):
                         priority_weight=0.5, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
-        # 简化版: 检测高频字之间的连接强度
+        # 景观模式: 用能量景观检测语义孤岛（高嵌入相似度但无低能连接）
         t0 = time.time()
         gaps = []
         
-        # 取前200个高频字
-        char_freq = Counter()
-        for w in self.idioms:
-            if len(w) == 4:
-                for c in w:
-                    char_freq[c] += 1
-        
-        top_chars = [c for c, _ in char_freq.most_common(200) if c in self.ci]
+        # 字符池: 景观模式取全部字场字符，传统模式取高频成语字
+        if self.idioms is not None:
+            char_freq = Counter()
+            for w in self.idioms:
+                if len(w) == 4:
+                    for c in w:
+                        char_freq[c] += 1
+            top_chars = [c for c, _ in char_freq.most_common(200) if c in self.ci]
+        else:
+            # 景观模式: 随机采样200个字符
+            import random as _random
+            all_chars = [c for c in self.ci.keys()]
+            top_chars = _random.sample(all_chars, min(200, len(all_chars)))
         
         # 检测哪些高频字对之间没有成语直接连接
+        # 传统模式: 用成语词典判定连接
+        # 景观模式: 用能量景观判定连接 (低中点能量 = 已连接)
         connected = set()
-        for w in self.idioms:
-            if len(w) == 4 and w[0] in self.ci and w[-1] in self.ci:
-                connected.add((w[0], w[-1]))
+        if self.idioms is not None:
+            for w in self.idioms:
+                if len(w) == 4 and w[0] in self.ci and w[-1] in self.ci:
+                    connected.add((w[0], w[-1]))
         
         anchors = self.field.anchors.to(self.device)
         with torch.no_grad():
@@ -827,52 +941,76 @@ class FreshnessFactor(FactorDetector):
                         priority_weight=0.7, from_landscape=from_landscape)
     
     def scan(self, partition_range=None) -> List[BlindSpot]:
+        # 景观模式: 用能量景观连接度判定"冷门"常用字
         t0 = time.time()
         gaps = []
         
-        # 统计成语中所有字
-        idiom_chars = set()
-        for w in self.idioms:
-            if len(w) == 4:
-                for c in w:
-                    idiom_chars.add(c)
-        
-        # 常用字但不出现在任何成语中 → 知识盲区
-        for ch in self.COMMON_CHARS:
-            if ch not in idiom_chars and ch in self.ci:
-                gap_score = 5.0  # 固定分数
-                gaps.append(BlindSpot(
-                    priority=-gap_score,
-                    char=ch,
-                    factor=self.name,
-                    score=gap_score,
-                    evidence={
-                        'is_common': True,
-                        'in_any_idiom': False,
-                    }
-                ))
-        
-        # 也检测: 在成语中出现但只出现在1-2个成语中的常用字
-        char_count = Counter()
-        for w in self.idioms:
-            if len(w) == 4:
-                for c in w:
-                    char_count[c] += 1
-        
-        for ch in self.COMMON_CHARS:
-            count = char_count.get(ch, 0)
-            if 1 <= count <= 2 and ch in self.ci:
-                gap_score = max(1.0, 5.0 - count)
-                gaps.append(BlindSpot(
-                    priority=-gap_score,
-                    char=ch,
-                    factor=self.name,
-                    score=gap_score,
-                    evidence={
-                        'is_common': True,
-                        'idiom_count': count,
-                    }
-                ))
+        # 统计"已知"字符: 传统模式用成语词典，景观模式用低能连接检测
+        if self.idioms is not None:
+            # 传统模式: 统计成语中所有字
+            idiom_chars = set()
+            for w in self.idioms:
+                if len(w) == 4:
+                    for c in w:
+                        idiom_chars.add(c)
+            
+            # 常用字但不出现在任何成语中 → 知识盲区
+            for ch in self.COMMON_CHARS:
+                if ch not in idiom_chars and ch in self.ci:
+                    gaps.append(BlindSpot(
+                        priority=-5.0, char=ch, factor=self.name,
+                        score=5.0,
+                        evidence={'is_common': True, 'in_any_idiom': False}
+                    ))
+            
+            # 也检测: 在成语中出现但只出现在1-2个成语中的常用字
+            char_count = Counter()
+            for w in self.idioms:
+                if len(w) == 4:
+                    for c in w:
+                        char_count[c] += 1
+            
+            for ch in self.COMMON_CHARS:
+                count = char_count.get(ch, 0)
+                if 1 <= count <= 2 and ch in self.ci:
+                    gaps.append(BlindSpot(
+                        priority=-(5.0 - count), char=ch, factor=self.name,
+                        score=max(1.0, 5.0 - count),
+                        evidence={'is_common': True, 'idiom_count': count}
+                    ))
+        else:
+            # 景观模式: 对每个常用字检查能量连接广度
+            # 采样目标字，统计低能连接数
+            anchors = self.field.anchors.to(self.device)
+            num_anchors = len(anchors)
+            sample_n = 100  # 每个常用字采样100个目标
+            
+            common_in_field = [ch for ch in self.COMMON_CHARS if ch in self.ci]
+            if len(common_in_field) > 300:
+                import random as _random
+                common_in_field = _random.sample(common_in_field, 300)
+            
+            tgt = anchors[torch.randint(0, num_anchors, (sample_n,), device=self.device)]
+            
+            with torch.no_grad():
+                for ch in common_in_field:
+                    idx = self.ci[ch]
+                    src = anchors[idx:idx+1].expand(sample_n, -1)
+                    mids = (src + tgt) / 2
+                    e = self.landscape(mids).squeeze(-1)
+                    low_conn = (e < -180).sum().item()  # 低能连接阈值
+                    
+                    if low_conn < sample_n * 0.3:  # 少于30%低能连接
+                        gap_score = (1 - low_conn / max(sample_n * 0.3, 1)) * 5
+                        gaps.append(BlindSpot(
+                            priority=-gap_score, char=ch, factor=self.name,
+                            score=gap_score,
+                            evidence={
+                                'is_common': True,
+                                'low_energy_connections': low_conn,
+                                'sample_targets': sample_n,
+                            }
+                        ))
         
         self._last_scan_time = time.time() - t0
         return gaps
@@ -941,8 +1079,7 @@ class MultiFactorDetector:
         self.num_partitions = num_partitions
         self.from_landscape = from_landscape
         
-        # 初始化7个因子
-        # 每个因子通过 from_landscape 标志决定使用 idioms 统计还是景观拓扑
+        # 初始化七因子（全部因子现已支持景观模式）
         self.factors = [
             StatisticalFactor(field, landscape, idioms, from_landscape=from_landscape),
             EnergyFactor(field, landscape, idioms, from_landscape=from_landscape),

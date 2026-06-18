@@ -7,7 +7,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.x-red.svg)](https://pytorch.org/)
 [![GPU](https://img.shields.io/badge/GPU-RTX%203060-green.svg)]()
-[![Version](https://img.shields.io/badge/version-v2.2-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-v2.3-orange.svg)]()
 
 ---
 
@@ -197,12 +197,12 @@ result = lp.query("人工智能")
 | 成语词典 | 29,514 条 |
 | 有向字对 (序列臂) | 14,800 对 (POETIC_NEXT) |
 | 盲区检测因子 | 7 个独立因子 |
-| 扫描速度 | ~30s/全因子全量扫描 (5,000+ 盲区) |
-| 守护学习速度 | **~75s/轮** (SQLite 加速后, 原 123s) |
+| 扫描速度 | ~30s/全因子全量扫描 (parallel=True) |
+| 守护学习速度 | **~63s/轮** (GPU加速+批量SGD, 原 90s) |
 | 序列臂训练 | 409 有向关联/每5轮 (~14s) |
 | 知识对齐 | 2,000 对概念/每5轮 |
 | EWC 锚定 | 每50轮 Fisher 采样 200 锚点 |
-| 能量分离度 | 锚点 ~-60 vs 随机 ~+15 (4x) |
+| 能量分离度 | 锚点 ~-250 vs 随机 ~-150, 分离度 4.2 |
 
 ---
 
@@ -325,6 +325,22 @@ loong-pearl/
 ---
 
 ## 📋 变更日志
+
+### v2.3 (2026-06-18) — 三引擎创造架构 + 全链路 GPU 加速
+
+- **三引擎设计**: 对抗扰动引擎 → D-S 假设生成器 → 梯度反推引擎，三引擎串联自主知识发现流水线
+  - 对抗扰动: 200 远距对参数注入 → 检测脆性信号 → D-S 验证修正 (`docs/perturbation_engine.md`)
+  - D-S 假设生成器: 三源汇聚 (扰动候选/弱概念边/高相似无连) → Dempster 组合 (`docs/ds_hypothesis_generator.md`)
+  - 梯度反推: 20000 球面采样 → 鞍点搜索 → 负梯度追踪 → 已知性检测 (`docs/gradient_reverse_engine.md`)
+- **七因子全部启用**: `from_landscape=True` 不再限制，7/7 因子有产出
+  - EnergyFactor: 硬编码 `-5.0` → P25 百分位数据驱动
+  - CoverageFactor: 景观模式用能量统计替代 idioms 词典
+  - GradientFactor/SemanticGapFactor/FreshnessFactor: 去掉 `idioms is None` 守卫
+- **Hebbian 批量 SGD**: 逐对循环 → 批量矩阵运算，107 对一次性处理
+- **扫描并行化**: `parallel=True` 启用，全量扫描 ~30s (vs 原 45s)
+- **所有硬编码阈值 → 数据驱动百分位**: 三引擎全部采用运行时 P90/P10/P5 自适应
+- **GPU 加速**: 源3 5000×5000 全矩阵单次 kernel launch ~2ms + 重载路径补 `.to(DEVICE)`
+- **守护速度**: 每轮 89.5s → 63.4s (-29%); 盲区扫描 6175~7566 去重; 分离度 33.3→4.2
 
 ### v2.2 (2026-06-18) — 架构补全 + 工程优化
 
