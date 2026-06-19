@@ -1552,9 +1552,11 @@ class Orchestrator:
         # ── 3. 定期调度 ──
         # ★ 每5轮: 对抗扰动 → D-S假设生成 (学习注入后执行)
         if round_num % 5 == 0:
+            pert_candidates = []
             try:
                 pert_report = self.perturbation.run()
                 if pert_report.n_candidates > 0:
+                    pert_candidates = pert_report.candidates
                     tick_report['perturbation'] = {
                         'candidates': pert_report.n_candidates,
                         'corrected': pert_report.n_corrected,
@@ -1563,12 +1565,18 @@ class Orchestrator:
             except Exception as e:
                 log.warning(f"  扰动引擎异常: {e}")
             try:
-                ds_report = self.ds_generator.run()
+                ds_report = self.ds_generator.run(
+                    perturbation_candidates=pert_candidates
+                )
                 if ds_report.n_injected > 0:
                     tick_report['ds_generated'] = {
                         'combined': ds_report.n_combined,
                         'injected': ds_report.n_injected,
                     }
+                else:
+                    log.info(f"  D-S生成器: {ds_report.n_source1}+"
+                            f"{ds_report.n_source2}+{ds_report.n_source3}"
+                            f" → {ds_report.n_combined}融合 → 0注入")
             except Exception as e:
                 log.warning(f"  D-S生成异常: {e}")
         

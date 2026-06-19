@@ -62,6 +62,7 @@ class PerturbationReport:
     energy_low_thresh: float = 0.0
     energy_drop_thresh: float = 0.0
     elapsed: float = 0.0
+    candidates: list = field(default_factory=list)  # ★ 候选列表供 D-S 生成器消费
     
     def __repr__(self):
         return (f"PerturbReport({self.n_candidates} candidates, "
@@ -160,6 +161,7 @@ class PerturbationEngine:
         candidates.sort(key=lambda c: c.score, reverse=True)
         candidates = candidates[:self.MAX_CANDIDATES]
         report.n_candidates = len(candidates)
+        report.candidates = candidates  # ★ 暴露给 D-S 生成器
         
         if not candidates:
             report.elapsed = time.time() - t0

@@ -69,7 +69,8 @@ class DSHypothesisGenerator:
     # 可调参数
     SIM_THRESHOLD = 0.75       # 源3高相似阈值
     MAX_CANDIDATES = 200       # 每源最多候选
-    INJECT_THRESHOLD = 0.7     # 注入置信度阈值
+    INJECT_THRESHOLD = 0.55    # 注入置信度阈值 (降低以提升注入率)
+    SIM_CHUNK_SIZE = 1000      # ★ 分块大小防止 OOM
     
     # 关系类型权重 (源2)
     RELATION_WEIGHTS = {
@@ -148,6 +149,10 @@ class DSHypothesisGenerator:
             log.info(f"  D-S生成器: {report.n_source1}+{report.n_source2}+"
                     f"{report.n_source3} → {report.n_combined}融合 → "
                     f"{report.n_injected}注入 ({report.elapsed:.1f}s)")
+        else:
+            log.info(f"  D-S生成器: {report.n_source1}+{report.n_source2}+"
+                    f"{report.n_source3} → {report.n_combined}融合 → "
+                    f"0注入 ({report.elapsed:.1f}s)")
         
         return report
     
@@ -232,21 +237,14 @@ class DSHypothesisGenerator:
     
     def _source_high_sim_no_edge(self) -> List[Hypothesis]:
         """
-        高相似无连接源: GPU 单次全矩阵计算 5000×5000 余弦相似度。
+        高相似无连接源: GPU 分块相似度矩阵 + numpy 批量提取，防 OOM。
         """
-        hypotheses = []
         anchors = self.field.anchors
         hanzi_list = self.field.hanzi_list
         
         search_range = min(5000, len(hanzi_list))
         if search_range < 2:
-            return hypotheses
-        
-        sub = anchors[:search_range].to(self.device)
-        sub_norm = F.normalize(sub, p=2, dim=1)
-        
-        # GPU 矩阵乘法 (N,D)×(D,N)→(N,N), ~100MB, ~2ms
-        sim_matrix = sub_norm @ sub_norm.T
+            return []
         
         # 已有边集合 (双向)
         existing = set()
@@ -256,25 +254,46 @@ class DSHypothesisGenerator:
                 existing.add((s, obj))
                 existing.add((obj, s))
         
-        # 上三角 + 高相似
-        mask_upper = torch.triu(
-            torch.ones_like(sim_matrix, dtype=torch.bool), diagonal=1
-        )
-        mask_sim = sim_matrix > self.SIM_THRESHOLD
-        candidates = (mask_upper & mask_sim).nonzero(as_tuple=False)
+        sub = anchors[:search_range].to(self.device)
+        sub_norm = F.normalize(sub, p=2, dim=1)
         
-        for idx_pair in candidates[:self.MAX_CANDIDATES * 3]:
-            qi, si = idx_pair[0].item(), idx_pair[1].item()
-            char_a = hanzi_list[qi]
-            char_b = hanzi_list[si]
+        chunk = self.SIM_CHUNK_SIZE
+        all_candidates = []
+        
+        for i_start in range(0, search_range, chunk):
+            i_end = min(i_start + chunk, search_range)
+            row_block = sub_norm[i_start:i_end]       # (chunk, D)
+            sim_block = row_block @ sub_norm.T         # (chunk, search_range)
             
-            if (char_a, char_b) in existing:
-                continue
+            # 上三角 mask + 高相似 mask
+            cols = torch.arange(search_range, device=self.device)
+            rows = torch.arange(i_start, i_end, device=self.device).unsqueeze(1)
+            upper_mask = rows < cols.unsqueeze(0)      # (chunk, search_range)
+            sim_mask = sim_block > self.SIM_THRESHOLD
+            hit_mask = upper_mask & sim_mask
             
-            sim_val = sim_matrix[qi, si].item()
+            if hit_mask.any():
+                hits = hit_mask.nonzero(as_tuple=False)  # (K, 2)
+                for idx in range(hits.shape[0]):
+                    ri = hits[idx, 0].item() + i_start
+                    ci = hits[idx, 1].item()
+                    sim_val = sim_block[hits[idx, 0], hits[idx, 1]].item()
+                    
+                    char_a = hanzi_list[ri]
+                    char_b = hanzi_list[ci]
+                    if (char_a, char_b) in existing:
+                        continue
+                    
+                    all_candidates.append((ri, ci, sim_val, char_a, char_b))
+                    if len(all_candidates) >= self.MAX_CANDIDATES * 3:
+                        break
+                if len(all_candidates) >= self.MAX_CANDIDATES * 3:
+                    break
+        
+        # 构建假设
+        hypotheses = []
+        for ri, ci, sim_val, char_a, char_b in all_candidates[:self.MAX_CANDIDATES]:
             rel = self._infer_relation(char_a, char_b)
-            
-            # mass: 0.2 + 0.6×(sim-0.75)/0.25 + 0.1×relation_novelty
             sim_norm = (sim_val - 0.75) / 0.25
             rel_novelty = {'RELATED': 1.0, 'PART_OF': 0.9, 'IS_A': 0.8,
                           'HAS': 0.7, 'CAUSE': 0.5}.get(rel, 0.8)
@@ -286,14 +305,9 @@ class DSHypothesisGenerator:
                 source='high_similarity_no_edge',
                 source_confidence=mass,
                 metadata={
-                    'cosine_sim': sim_val,
-                    'embedding_norm_a': sub[qi].norm().item(),
-                    'embedding_norm_b': sub[si].norm().item(),
+                    'cosine_sim': float(sim_val),
                 }
             ))
-            
-            if len(hypotheses) >= self.MAX_CANDIDATES:
-                break
         
         return hypotheses
     
