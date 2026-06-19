@@ -326,6 +326,13 @@ loong-pearl/
 
 ## 📋 变更日志
 
+### v2.6 (2026-06-19) — 三引擎产品级优化
+
+- **Dempster 组合公式修复** (严重 bug): 旧公式 `numerator/(1-K)` 为代数恒等式导致任何两源融合=1.0。改为标准 D-S 迭代 `m₁+m₂-m₁·m₂` (框架 Θ={H,¬H}, K=0)
+- **关系推断增强** (`_infer_relation`): 从 4 条硬编码阈值 → 4 层策略级联 (CG查证→嵌入几何→因果检测→反义检测), 现可生成全部 6 种关系 (IS_A/PART_OF/HAS/CAUSE/OPPOSITE/RELATED)
+- **源3 分块自适应**: 硬编码 `SIM_CHUNK_SIZE=1000` → VRAM 感知动态计算 + 三级 OOM 降级 (GPU全速→半chunk→CPU兜底)
+- **源1 集成验证**: 确认 perturbation→D-S 全链路闭合 (orchestrator 传入 `perturbation_candidates`)
+
 ### v2.5 (2026-06-19) — 三引擎创造架构实现
 
 - **三引擎全部实现为运行代码** (非设计文档):
