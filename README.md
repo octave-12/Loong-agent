@@ -332,6 +332,8 @@ loong-pearl/
 - **关系推断增强** (`_infer_relation`): 从 4 条硬编码阈值 → 4 层策略级联 (CG查证→嵌入几何→因果检测→反义检测), 现可生成全部 6 种关系 (IS_A/PART_OF/HAS/CAUSE/OPPOSITE/RELATED)
 - **源3 分块自适应**: 硬编码 `SIM_CHUNK_SIZE=1000` → VRAM 感知动态计算 + 三级 OOM 降级 (GPU全速→半chunk→CPU兜底)
 - **源1 集成验证**: 确认 perturbation→D-S 全链路闭合 (orchestrator 传入 `perturbation_candidates`)
+- **PerturbationEngine cg 直引**: `_check_edge` 从 `fuzzy.cg` 间接引用 → 构造时直接传入 `cg`, 消除过度 unlearn 风险
+- **OPPOSITE 防误报**: 策略B 从宽松 `sim<0.45+范数0.80~1.25` → 三严格条件 (sim∈[0.30,0.50] + norm∈[0.90,1.10] + CG OPPOSITE经验)
 
 ### v2.5 (2026-06-19) — 三引擎创造架构实现
 
