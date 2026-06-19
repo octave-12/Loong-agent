@@ -303,7 +303,7 @@ class Orchestrator:
         if self._perturbation is None:
             from loongpearl.learning.perturbation_engine import PerturbationEngine
             self._perturbation = PerturbationEngine(
-                self.field, self.landscape, self.learner, self.fuzzy
+                self.field, self.landscape, self.learner, self.fuzzy, self.cg
             )
         return self._perturbation
     

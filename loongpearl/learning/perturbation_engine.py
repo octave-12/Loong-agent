@@ -85,11 +85,12 @@ class PerturbationEngine:
     N_DISTANT_PAIRS = 200    # 远距对数量
     MAX_CANDIDATES = 30      # 最多候选数
     
-    def __init__(self, field, landscape, learner=None, fuzzy=None):
+    def __init__(self, field, landscape, learner=None, fuzzy=None, cg=None):
         self.field = field
         self.landscape = landscape
         self.learner = learner
         self.fuzzy = fuzzy
+        self.cg = cg
         self.device = next(landscape.parameters()).device
     
     # ═══════════════════════════════════════════════════════════════
@@ -318,11 +319,12 @@ class PerturbationEngine:
         return corrected, verified
     
     def _check_edge(self, char_a: str, char_b: str) -> bool:
-        """检查概念图中是否存在边"""
-        if self.fuzzy is None:
-            return False
-        
-        cg = getattr(self.fuzzy, 'cg', None)
+        """检查概念图中是否存在边 (双向)"""
+        # 优先使用直接 cg 引用 (PerturbationEngine 构造时传入)
+        cg = self.cg
+        if cg is None:
+            # 回退: 从 fuzzy 间接获取 (兼容旧构造)
+            cg = getattr(self.fuzzy, 'cg', None) if self.fuzzy else None
         if cg is None:
             return False
         

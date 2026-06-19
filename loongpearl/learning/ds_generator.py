@@ -470,28 +470,43 @@ class DSHypothesisGenerator:
     def _detect_opposite_pattern(self, char_a: str, char_b: str,
                                    sim: float) -> bool:
         """
-        对立模式检测:
-        - CG 中存在 a OPPOSITE X 且 X 与 b 高相似
-        - 低相似度 + 范数对称 (反义词嵌入特征)
+        对立模式检测 (保守策略, 防误报):
+        - 策略A: CG 反义链 (最可靠, 优先)
+        - 策略B: 窄带反义几何特征 (严格条件, 避免大量假阳性)
+          * sim ∈ [0.30, 0.50] (反义词共享语义域)
+          * norm_ratio ∈ [0.90, 1.10] (同语义层级)
+          * 至少一方在 CG 中有 OPPOSITE 关系 (有反义"经验")
         """
         fwd = getattr(self.cg, 'forward_index', None)
         
-        # 策略A: CG 反义链
+        # 策略A: CG 反义链 — a OPPOSITE X 且 X≈b
         if fwd and char_a in fwd:
             for obj, rel in fwd[char_a].items():
                 if rel == 'OPPOSITE' and obj != char_b:
-                    if self._char_similarity(char_b, obj) > 0.60:
+                    if self._char_similarity(char_b, obj) > 0.55:
                         return True
         
-        # 策略B: 低相似 + 范数对称 → 潜在反义
-        if sim < 0.45:
-            ia = self.field._char_to_idx.get(char_a)
-            ib = self.field._char_to_idx.get(char_b)
-            if ia is not None and ib is not None:
-                na = self.field.anchors[ia].norm().item()
-                nb = self.field.anchors[ib].norm().item()
-                if 0.80 < na / (nb + 1e-8) < 1.25:
-                    return True
+        # 策略B: 窄带反义几何 — 严格三条件
+        #  条件1: sim 在反义词区间 (共享语义域但方向相反)
+        if not (0.30 < sim < 0.50):
+            return False
+        
+        #  条件2: 范数对称 (同等语义层级)
+        ia = self.field._char_to_idx.get(char_a)
+        ib = self.field._char_to_idx.get(char_b)
+        if ia is None or ib is None:
+            return False
+        na = self.field.anchors[ia].norm().item()
+        nb = self.field.anchors[ib].norm().item()
+        if not (0.90 < na / (nb + 1e-8) < 1.10):
+            return False
+        
+        #  条件3: 至少一方在 CG 中有 OPPOSITE 经验
+        if fwd:
+            has_opp_a = any(rel == 'OPPOSITE' for rel in fwd.get(char_a, {}).values())
+            has_opp_b = any(rel == 'OPPOSITE' for rel in fwd.get(char_b, {}).values())
+            if has_opp_a or has_opp_b:
+                return True
         
         return False
     
