@@ -1,0 +1,193 @@
+{
+  "time": "2026-06-19 10:52:41",
+  "total_queries": 16,
+  "total_checks": 24,
+  "passed": 23,
+  "load_time": 149.37496066093445,
+  "results": [
+    {
+      "query": "你好",
+      "cat": "闲聊",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 45,
+      "elapsed": 5.041741132736206,
+      "checks": {
+        "有回答": true,
+        "置信度高": true
+      }
+    },
+    {
+      "query": "你是谁",
+      "cat": "身份",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 136,
+      "elapsed": 2.9856936931610107,
+      "checks": {
+        "有回答": true,
+        "含龙珠": true
+      }
+    },
+    {
+      "query": "你能做什么",
+      "cat": "能力",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 136,
+      "elapsed": 3.2348783016204834,
+      "checks": {
+        "有回答": true,
+        "非空回复": true
+      }
+    },
+    {
+      "query": "谢谢",
+      "cat": "礼貌",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 31,
+      "elapsed": 2.336024761199951,
+      "checks": {
+        "有回答": true
+      }
+    },
+    {
+      "query": "今天天气怎么样",
+      "cat": "社交",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 67,
+      "elapsed": 2.8700003623962402,
+      "checks": {
+        "有回答": true
+      }
+    },
+    {
+      "query": "龙是什么",
+      "cat": "CG内",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 47,
+      "elapsed": 22.00688123703003,
+      "checks": {
+        "有回答": true,
+        "含主题字": true
+      }
+    },
+    {
+      "query": "李白是谁",
+      "cat": "CG内",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 47,
+      "elapsed": 11.999417066574097,
+      "checks": {
+        "有回答": true,
+        "非空": true
+      }
+    },
+    {
+      "query": "什么是人工智能",
+      "cat": "CG外",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 56,
+      "elapsed": 12.25129747390747,
+      "checks": {
+        "诚实响应": true
+      }
+    },
+    {
+      "query": "量子力学是什么",
+      "cat": "CG外",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 56,
+      "elapsed": 12.517849445343018,
+      "checks": {
+        "诚实响应": true
+      }
+    },
+    {
+      "query": "写一首关于春天的诗",
+      "cat": "诗词",
+      "signal": "certain",
+      "confidence": 0.9,
+      "answer_len": 47,
+      "elapsed": 3.464655637741089,
+      "checks": {
+        "有输出": true,
+        "固定格式": true
+      }
+    },
+    {
+      "query": "以月亮为题写诗",
+      "cat": "诗词",
+      "signal": "certain",
+      "confidence": 0.9,
+      "answer_len": 45,
+      "elapsed": 4.782843112945557,
+      "checks": {
+        "有输出": true
+      }
+    },
+    {
+      "query": "画龙点睛是什么意思",
+      "cat": "成语查询",
+      "signal": "certain",
+      "confidence": 1.0,
+      "answer_len": 28,
+      "elapsed": 2.354203462600708,
+      "checks": {
+        "有回答": true
+      }
+    },
+    {
+      "query": "龙飞凤舞下一句",
+      "cat": "成语接龙",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 56,
+      "elapsed": 22.79348373413086,
+      "checks": {
+        "有回答": true
+      }
+    },
+    {
+      "query": "",
+      "cat": "空输入",
+      "signal": "certain",
+      "confidence": 0.0,
+      "answer_len": 0,
+      "elapsed": 6.890296936035156e-05,
+      "checks": {
+        "不崩溃": true,
+        "快速返回": false
+      }
+    },
+    {
+      "query": "?",
+      "cat": "符号",
+      "signal": "certain",
+      "confidence": 0.0,
+      "answer_len": 8,
+      "elapsed": 2.9460818767547607,
+      "checks": {
+        "不崩溃": true
+      }
+    },
+    {
+      "query": "龘",
+      "cat": "生僻字",
+      "signal": "conflict",
+      "confidence": 0.45,
+      "answer_len": 38,
+      "elapsed": 10.917337417602539,
+      "checks": {
+        "不崩溃": true,
+        "有回复或诚实": true
+      }
+    }
+  ]
+}
