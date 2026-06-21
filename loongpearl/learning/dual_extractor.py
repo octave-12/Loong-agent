@@ -105,6 +105,6 @@ class DualExtractor:
             return triples
 
         # 正则无结果 → LLM 兜底
-        log.info(f"正则无结果，尝试LLM提取 (文本{len(text)}字)")
+        log.debug(f"正则无结果，尝试LLM提取 (文本{len(text)}字)")
         llm_triples = self.extract_llm(text)
         return llm_triples if llm_triples else []

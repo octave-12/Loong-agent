@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-龙珠调度器 (Orchestrator) v3 — 信号驱动闭环推理中枢
+龙珠调度器 (Orchestrator) v4 — 生命体架构事件驱动
 ═══════════════════════════════════════════════════
 
 五步推理管道:
@@ -38,7 +38,7 @@ log = logging.getLogger('orchestrator')
 
 class Orchestrator:
     """
-    龙珠调度器 v3 — 信号驱动闭环推理。
+    龙珠调度器 v4 — 生命体架构事件驱动。
 
     核心变更:
       - dialogue() 保留，向后兼容旧的四层路由
@@ -48,6 +48,7 @@ class Orchestrator:
 
     # ── 信号处理配置 ──
     MAX_SIGNAL_ITERATIONS = 3     # 最多迭代3次
+    MIN_ABSORB_PAIRS = 5          # 最小吸收字对数 (低于此阈值跳过注入)
 
     def __init__(self, field, landscape, concept_graph, learner=None):
         self.field = field
@@ -1655,7 +1656,7 @@ class Orchestrator:
         if gaps:
             try:
                 all_pairs = self._arms_search_batch(gaps[:3])
-                if all_pairs and self.learner:
+                if all_pairs and self.learner and len(all_pairs) >= self.MIN_ABSORB_PAIRS:
                     inject_result = self.learner.learn_pairs_batch(
                         all_pairs, learning_rate=0.05
                     )
@@ -2228,7 +2229,7 @@ class Orchestrator:
         mkg_stats = self.mkg.stats() if self._mkg else {}
         ml_stats = self.multilang.stats() if self._multilang else {}
         lines = [
-            "═══ 龙珠调度器 v3 状态 ═══",
+            "═══ 龙珠生命体 v4 状态 ═══",
             f"运行时间: {time.time() - self._init_time:.0f}s",
             f"信号迭代上限: {self.MAX_SIGNAL_ITERATIONS}",
             "",
@@ -2403,24 +2404,30 @@ class Orchestrator:
         # 标记需要额外处理 (stdin 需要阻塞读取，不能放进 generator yield 语义)
         # → 在 run_lifeform 中特殊处理
 
-        # ★ 事件源 2: 认知地形盲区 (每 N 秒扫描)
+        # ★ 事件源 2: 认知地形盲区 (每 N 秒扫描, 非阻塞)
         def blindspot_source(interval: float = 30.0):
+            """非阻塞盲区扫描 — 到时间才 yield 事件, 否则 yield None"""
+            last_scan = 0
+            terrain = None
             while True:
-                time.sleep(interval)
+                now = time.time()
+                if now - last_scan < interval:
+                    yield None  # 还没到时间
+                    continue
+                last_scan = now
                 try:
-                    # 懒加载 cognitive_terrain
-                    if not hasattr(self, '_terrain'):
+                    if terrain is None:
                         from loongpearl.core.cognitive_terrain import CognitiveTerrain
                         db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
-                        self._terrain = CognitiveTerrain(
+                        terrain = CognitiveTerrain(
                             landscape_path=None,
                             field_path=None,
                             db_path=db_path,
                         )
-                        self._terrain.load()
+                        terrain.load()
                         log.info("  🗺️ 认知地形加载完成 (盲区事件源)")
 
-                    blind_spots = self._terrain.top_blind_spots(n=5)
+                    blind_spots = terrain.top_blind_spots(n=5)
                     for tp in blind_spots:
                         if tp.concept:
                             yield self.LifeEvent(
@@ -2431,15 +2438,21 @@ class Orchestrator:
                             )
                 except Exception as e:
                     log.debug(f"  盲区扫描跳过: {e}")
+                yield None  # 本轮扫描完成, 继续非阻塞等待
 
         sources.append(blindspot_source)
 
-        # ★ 事件源 3: 定期维护定时器
+        # ★ 事件源 3: 定期维护定时器 (非阻塞)
         def timer_source(round_interval: int = 1):
-            """每 round_interval 秒发射一个 TIMER 事件"""
+            """非阻塞定时器 — 到时间才 yield 事件, 否则 yield None"""
             round_num = 0
+            last_timer = time.time()
             while True:
-                time.sleep(round_interval)
+                now = time.time()
+                if now - last_timer < round_interval:
+                    yield None  # 还没到时间
+                    continue
+                last_timer = now
                 round_num += 1
                 yield self.LifeEvent(
                     etype=self.EventType.TIMER,
@@ -2453,7 +2466,8 @@ class Orchestrator:
 
     # ── 生命体主循环 ──
 
-    def run_lifeform(self, mode: str = 'chat', timer_interval: int = 120):
+    def run_lifeform(self, mode: str = 'chat', timer_interval: int = 120,
+                     max_rounds: int = 0):
         """
         事件驱动主循环 — 替代 run_chat 和 run_daemon。
 
@@ -2464,6 +2478,7 @@ class Orchestrator:
         Args:
             mode: 'chat' | 'daemon'
             timer_interval: 守护模式定时器间隔(秒)，默认 120
+            max_rounds: 守护模式最大轮数，0=无限，默认 0
 
         核心循环:
           while True:
@@ -2485,16 +2500,12 @@ class Orchestrator:
         signal.signal(signal.SIGINT, _shutdown)
         signal.signal(signal.SIGTERM, _shutdown)
 
-        # 注册事件源 (仅守护模式需要后台事件源)
-        if mode == 'daemon':
-            event_sources = self.register_event_sources()
-            source_iters = []
-            if len(event_sources) >= 2:
-                source_iters.append(event_sources[0](interval=30.0))   # blindspot_source
-                source_iters.append(event_sources[1](round_interval=timer_interval)) # timer_source
-        else:
-            event_sources = []
-            source_iters = []
+        # 注册事件源 (chat 和 daemon 都启用，非阻塞模式)
+        event_sources = self.register_event_sources()
+        source_iters = []
+        if len(event_sources) >= 2:
+            source_iters.append(event_sources[0](interval=30.0))   # blindspot_source
+            source_iters.append(event_sources[1](round_interval=max(timer_interval, 1))) # timer_source
 
         round_num = 0
         last_express_time = time.time()
@@ -2598,6 +2609,16 @@ class Orchestrator:
                 except Exception as e:
                     log.warning(f"  事件处理异常 [{evt.etype}]: {e}")
 
+            # ── 守护模式进度日志 ──
+            if mode == 'daemon' and events_this_tick:
+                for evt in events_this_tick:
+                    if evt.etype == self.EventType.INTERNAL_BLINDSPOT:
+                        log.info(f"  🧠 盲区学习: '{evt.payload.get('concept','?')}' "
+                                f"(能量={evt.payload.get('energy',0):.1f})")
+                    elif evt.etype == self.EventType.TIMER:
+                        rn = evt.payload.get('round_num', 0)
+                        log.info(f"  ⏰ 第{rn}轮定时维护")
+
             # ── 守护模式下定期保存 ──
             if mode == 'daemon' and round_num > 0 and round_num % 5 == 0:
                 try:
@@ -2613,6 +2634,11 @@ class Orchestrator:
                     log.warning(f"  保存失败: {e}")
 
             round_num += 1
+
+            # ── 轮数上限 ──
+            if max_rounds > 0 and round_num >= max_rounds:
+                log.info(f"\n✅ 完成 {max_rounds} 轮, 退出")
+                running = False
 
         # ── 优雅停止 ──
         log.info("💾 保存最终状态...")

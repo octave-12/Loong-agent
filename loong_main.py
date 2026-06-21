@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-龙珠统一入口 v3 — 8引擎全栈集成
+龙珠统一入口 v4 — 生命体架构事件驱动
 ═══════════════════════════════════════════════════════
 
 新模式:
@@ -504,7 +504,8 @@ def run_daemon(field, landscape, learner, args):
             was_locked = False
 
         # ★ 委托给统一的生命体循环
-        orch.run_lifeform(mode='daemon', timer_interval=args.interval)
+        orch.run_lifeform(mode='daemon', timer_interval=args.interval,
+                         max_rounds=args.max_rounds)
         break  # run_lifeform 返回后退出
 
 
@@ -531,7 +532,7 @@ except ImportError:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='🐉 龙珠统一入口 v3 — 8引擎全栈',
+        description='🐉 龙珠统一入口 v4 — 事件驱动生命体',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ═══════════════════════════════════════════════════
