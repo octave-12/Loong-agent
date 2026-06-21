@@ -547,8 +547,8 @@ class ConceptGraph:
         key = f"{subject}|{relation}|{obj}"
         if key in self.triples:
             existing = self.triples[key]
-            # 合并证据
-            existing.evidence_count += evidence_count
+            # 合并证据（防御性类型转换）
+            existing.evidence_count = int(existing.evidence_count) + int(evidence_count)
             existing.confidence = max(existing.confidence, confidence)
             return existing
 
@@ -1662,11 +1662,20 @@ class ConceptGraph:
             self.node_aliases = graph_data.get('aliases', {})
 
             for td in graph_data.get('triples', []):
+                # 安全提取字段（防御JSON中意外类型）
+                try:
+                    conf = float(td.get('c', 0.5))
+                except (ValueError, TypeError):
+                    conf = 0.5
+                try:
+                    ev = int(td.get('ev', 1))
+                except (ValueError, TypeError):
+                    ev = 1
                 self.add_triple(
                     td['s'], td['r'], td['o'],
-                    confidence=td.get('c', 0.5),
-                    source=td.get('src', 'unknown'),
-                    evidence_count=td.get('ev', 1),
+                    confidence=conf,
+                    source=str(td.get('src', 'unknown')),
+                    evidence_count=ev,
                 )
 
         self._data_dir = os.path.dirname(base) if os.path.dirname(base) else '.'
