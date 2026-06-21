@@ -49,6 +49,30 @@ import json
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 来源权重表 — 不同来源可信度不同
+# ═══════════════════════════════════════════════════════════════════════════
+
+SOURCE_WEIGHTS = {
+    "wikipedia_dump": 0.7,
+    "concept_graph": 0.5,
+    "user_input": 0.6,
+    "cedict": 0.4,
+    "unihan": 0.4,
+    "perturbation": 0.2,
+}
+
+
+def resolve_source_weight(source: str) -> float:
+    """根据来源名解析权重。精确匹配 → 前缀匹配 → 默认1.0"""
+    if source in SOURCE_WEIGHTS:
+        return SOURCE_WEIGHTS[source]
+    for prefix, weight in SOURCE_WEIGHTS.items():
+        if source.startswith(prefix):
+            return weight
+    return 1.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # D-S 证据理论核心
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -59,10 +83,18 @@ class Evidence:
     mass: float                   # 基本概率分配 (0~1)
     description: str = ""         # 证据描述
     timestamp: float = 0.0        # 时间戳
+    source_weight: float = 1.0    # 来源权重 (0~1)
 
     def __post_init__(self):
         if self.mass < 0 or self.mass > 1:
             raise ValueError(f"mass 必须在 [0,1] 范围内，得到 {self.mass}")
+        if self.source_weight < 0 or self.source_weight > 1:
+            raise ValueError(f"source_weight 必须在 [0,1] 范围内，得到 {self.source_weight}")
+
+    @property
+    def effective_mass(self) -> float:
+        """来源加权后的有效质量"""
+        return self.mass * self.source_weight
 
 
 @dataclass
@@ -188,17 +220,19 @@ class FuzzyGraph:
     def add_evidence(self, subject: str, relation: str, obj: str,
                      source: str, mass: float = 0.5,
                      description: str = "",
-                     timestamp: float = None) -> BPA:
+                     timestamp: float = None,
+                     source_weight: float = None) -> BPA:
         """
         为一条三元组添加证据。
 
         Args:
-            subject:   主体
-            relation:  关系
-            obj:       客体
-            source:    证据来源
-            mass:      基本概率分配 (0~1)
-            description: 证据描述
+            subject:       主体
+            relation:      关系
+            obj:           客体
+            source:        证据来源
+            mass:          基本概率分配 (0~1)
+            description:   证据描述
+            source_weight: 来源权重 (0~1)，None 则从 SOURCE_WEIGHTS 自动解析
 
         Returns:
             更新后的 BPA
@@ -207,11 +241,15 @@ class FuzzyGraph:
         if timestamp is None:
             timestamp = time.time()
 
+        if source_weight is None:
+            source_weight = resolve_source_weight(source)
+
         ev = Evidence(
             source=source,
             mass=mass,
             description=description,
             timestamp=timestamp,
+            source_weight=source_weight,
         )
 
         key = (subject, relation, obj)
@@ -267,6 +305,151 @@ class FuzzyGraph:
         key = (subject, relation, obj)
         bpa = self._bpas.get(key)
         return bpa.evidences if bpa else []
+
+    # ═════════════════════════════════════════════════════════════════════
+    # 时间衰减 + 多源加权融合 (L5 升级)
+    # ═════════════════════════════════════════════════════════════════════
+
+    def combine_with_decay(self, subject: str, relation: str, obj: str,
+                           memory_timeline=None,
+                           half_life_days: float = 90.0,
+                           decay_factor: float = None) -> float:
+        """
+        D-S 融合时应用时间衰减。
+
+        对命题的每条证据:
+          mass_effective = mass * source_weight * decay_factor
+        再用 Dempster 组合规则融合。
+
+        Args:
+            subject, relation, obj: 三元组
+            memory_timeline:        MemoryTimeline 实例，用于查询时间衰减
+            half_life_days:         半衰期(天)，默认90
+            decay_factor:           直接指定衰减因子，优先级高于 memory_timeline
+
+        Returns:
+            时间衰减后的 D-S 融合信念质量
+        """
+        evidences = self.get_evidences(subject, relation, obj)
+        if not evidences:
+            return 0.0
+
+        # 确定衰减因子
+        if decay_factor is None:
+            if memory_timeline is not None:
+                decay_factor = memory_timeline.time_decay_mass(
+                    subject, half_life_days=half_life_days
+                )
+            else:
+                decay_factor = 1.0
+
+        # 应用衰减 → 生成临时 Evidence 列表
+        decayed = []
+        for ev in evidences:
+            eff = ev.mass * ev.source_weight * decay_factor
+            eff = min(1.0, max(0.0, eff))
+            decayed.append(Evidence(
+                source=f"{ev.source}[decayed]",
+                mass=eff,
+                description=ev.description,
+                timestamp=ev.timestamp,
+                source_weight=ev.source_weight,
+            ))
+
+        return DempsterShafer.combine_evidences(decayed)
+
+    def multi_source_fuse(self, subject: str, relation: str, obj: str,
+                          memory_timeline=None,
+                          half_life_days: float = 90.0,
+                          decay_factor: float = None) -> Dict[str, Any]:
+        """
+        多源加权融合：查询所有来源证据，应用来源权重+时间衰减，D-S 融合。
+
+        这是完整的多源证据融合管道，输出最终置信度及置信区间。
+
+        Args:
+            subject, relation, obj: 三元组
+            memory_timeline:        MemoryTimeline 实例（可选）
+            half_life_days:         半衰期(天)，默认90
+            decay_factor:           直接指定衰减因子，优先级高于 memory_timeline
+
+        Returns:
+            {
+                "proposition": str,
+                "belief": float,           # Bel: 信念质量
+                "plausibility": float,     # Pl: 似然性
+                "interval": [Bel, Pl],     # 置信区间
+                "combined_mass": float,    # D-S 组合后的质量
+                "evidence_count": int,     # 证据条数
+                "sources": [str, ...],     # 来源列表
+                "decay_factor": float,     # 时间衰减因子
+                "source_weights_used": {source: weight},
+            }
+        """
+        evidences = self.get_evidences(subject, relation, obj)
+
+        if not evidences:
+            return {
+                "proposition": f"{subject} {relation} {obj}",
+                "belief": 0.0,
+                "plausibility": 0.0,
+                "interval": [0.0, 0.0],
+                "combined_mass": 0.0,
+                "evidence_count": 0,
+                "sources": [],
+                "decay_factor": 1.0,
+                "source_weights_used": {},
+            }
+
+        # 时间衰减因子
+        if decay_factor is None:
+            if memory_timeline is not None:
+                decay_factor = memory_timeline.time_decay_mass(
+                    subject, half_life_days=half_life_days
+                )
+            else:
+                decay_factor = 1.0
+
+        # 应用来源权重 + 时间衰减
+        decayed = []
+        sources_seen = []
+        weights_used = {}
+
+        for ev in evidences:
+            eff = ev.mass * ev.source_weight * decay_factor
+            eff = min(1.0, max(0.0, eff))
+            decayed.append(Evidence(
+                source=ev.source,
+                mass=eff,
+                description=ev.description,
+                timestamp=ev.timestamp,
+                source_weight=ev.source_weight,
+            ))
+            if ev.source not in sources_seen:
+                sources_seen.append(ev.source)
+            weights_used[ev.source] = ev.source_weight
+
+        # D-S 融合
+        combined = DempsterShafer.combine_evidences(decayed)
+
+        # 计算 Pl
+        bpa = BPA(
+            proposition=f"{subject} {relation} {obj}",
+            evidences=decayed,
+            combined_mass=combined,
+        )
+
+        return {
+            "proposition": bpa.proposition,
+            "belief": bpa.belief(),
+            "plausibility": bpa.plausibility(),
+            "interval": list(bpa.uncertainty_interval()),
+            "combined_mass": combined,
+            "evidence_count": len(evidences),
+            "sources": sources_seen,
+            "decay_factor": decay_factor,
+            "source_weights_used": weights_used,
+        }
 
     def total_evidence_count(self) -> int:
         """所有证据总数"""
@@ -416,6 +599,7 @@ class FuzzyGraph:
                     "mass": e.mass,
                     "description": e.description,
                     "timestamp": e.timestamp,
+                    "source_weight": e.source_weight,
                 } for e in bpa.evidences],
                 "conflict_with": bpa.conflict_with,
             }
@@ -442,6 +626,7 @@ class FuzzyGraph:
                         mass=ev_data["mass"],
                         description=ev_data.get("description", ""),
                         timestamp=ev_data.get("timestamp", 0.0),
+                        source_weight=ev_data.get("source_weight", 1.0),
                     ))
                 self._bpas[(s, r, o)] = bpa
 

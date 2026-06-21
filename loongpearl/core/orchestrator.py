@@ -21,7 +21,10 @@ import time
 import re
 import logging
 import threading
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Callable, Generator
+from dataclasses import dataclass, field as dc_field
+from collections import deque
+from enum import Enum, auto
 
 import torch
 
@@ -514,9 +517,39 @@ class Orchestrator:
             return {'path': 'fuzzy_fusion', 'result': None, 'fallback': False}
 
     def _route_factual(self, text: str, query_chars: list) -> Dict:
-        """事实类查询: 概念图 IS_A / DEFINED_AS 优先"""
+        """事实类查询: 四阶段管线优先 → 概念图 IS_A / DEFINED_AS 回退"""
         result = {'path': 'concept_graph', 'result': None, 'fallback': False}
 
+        # ★ 接线1: 优先走四阶段管线
+        try:
+            from loongpearl.core.stage4_integration import answer_question
+            # 用原始查询文本作为concept来源 (query_chars已被拆成单字, 会丢失"原子"→"原")
+            # 提取查询中的核心概念: 取query_chars中连续的汉字块
+            concept = text  # fallback: 用整个查询文本
+            # 对"X是什么"/"什么是X"格式提取X
+            import re as _re
+            m = _re.search(r'什么是(.+)', text)
+            if m:
+                concept = m.group(1).strip()
+            else:
+                m = _re.search(r'(.+?)是什么', text)
+                if m:
+                    concept = m.group(1).strip()
+            stage4_result = answer_question(
+                query=text,
+                parsed={'concepts': [concept], 'question_type': 'factual'},
+            )
+            if (stage4_result.get('sufficient')
+                    or stage4_result.get('associations')
+                    or stage4_result.get('wiki_verified')):
+                result['path'] = 'stage4'
+                result['result'] = stage4_result
+                result['fallback'] = False
+                return result
+        except Exception as e:
+            log.debug(f"  Stage4 管线未就绪，回退 CG 直查: {e}")
+
+        # 回退: 概念图 IS_A / DEFINED_AS 直查
         for ch in query_chars[:5]:
             triples = self._get_triples_for(ch)
             for rel, obj, conf, src in triples:
@@ -704,6 +737,42 @@ class Orchestrator:
                 result['confidence'] = top[1]
                 result['debug']['next_chars'] = candidates[:5]
                 return result
+
+        # ★ 接线2: 四阶段管线 → 结构化知识直接输出
+        if route['path'] == 'stage4' and route.get('result') and not route.get('fallback'):
+            stage4_result = route['result']
+            # 提取结构化知识
+            structured_data = {
+                'summary': stage4_result.get('summary', ''),
+                'definition': stage4_result.get('definition', []),
+                'taxonomy': stage4_result.get('taxonomy', []),
+                'associations': stage4_result.get('associations', []),
+                'wiki_verified': stage4_result.get('wiki_verified', []),
+                'sources': stage4_result.get('sources', []),
+            }
+            result['answer'] = self._generate_answer(
+                question_text, structured_data, source='stage4'
+            )
+            # 根据 wiki 验证数量设置置信度
+            wiki_count = len(stage4_result.get('wiki_verified', []))
+            if wiki_count >= 2:
+                result['signal'] = 'certain'
+                result['confidence'] = 0.9
+            elif wiki_count == 1:
+                result['signal'] = 'certain'
+                result['confidence'] = 0.75
+            elif stage4_result.get('definition') or stage4_result.get('associations'):
+                result['signal'] = 'certain'
+                result['confidence'] = 0.6
+            else:
+                result['signal'] = 'low_confidence'
+                result['confidence'] = 0.4
+            result['debug']['stage4'] = {
+                'wiki_verified': wiki_count,
+                'has_definition': bool(stage4_result.get('definition')),
+                'has_taxonomy': bool(stage4_result.get('taxonomy')),
+            }
+            return result
 
         # ── 第三步: 能量景观梯度下降推理 ──
         infer_result = self.landscape.infer(
@@ -1257,8 +1326,39 @@ class Orchestrator:
         """
         signal = result.get('signal', 'certain')
 
+        # === 四阶段管线: 结构化知识直接输出 ===
+        if source == "stage4":
+            summary = result.get('summary', '')
+            definition = result.get('definition', [])
+            wiki_verified = result.get('wiki_verified', [])
+            associations = result.get('associations', [])
+            sources = result.get('sources', [])
+
+            parts = []
+            if summary:
+                parts.append(summary)
+            if definition:
+                parts.append(f"定义: {'; '.join(str(d) for d in definition[:3])}")
+            if associations:
+                assoc_strs = []
+                for a in associations[:5]:
+                    if isinstance(a, dict):
+                        assoc_strs.append(str(a.get('concept', a.get('object', str(a)))))
+                    else:
+                        assoc_strs.append(str(a))
+                if assoc_strs:
+                    parts.append(f"关联概念: {', '.join(assoc_strs)}")
+            if sources:
+                src_strs = [str(s) for s in sources[:3] if s]
+                if src_strs:
+                    parts.append(f"来源: {', '.join(src_strs)}")
+            if wiki_verified:
+                parts.append(f"✓ 已通过 {len(wiki_verified)} 个独立源交叉验证")
+
+            answer_body = '\n'.join(parts) if parts else f"关于「{question}」，暂未找到足够的结构化知识。"
+
         # === 知识推理: 直接解码 ===
-        if source == "knowledge":
+        elif source == "knowledge":
             top_chars = result.get('top_candidates', [])
             converge_state = result.get('state')
             if converge_state is not None and top_chars:
@@ -1380,19 +1480,51 @@ class Orchestrator:
     # ═══════════════════════════════════════════════════════════════════
 
     def _sync_fuzzy_to_cg(self):
-        """将 D-S 融合后的置信度回写到概念图"""
+        """将 D-S 融合后的置信度回写到概念图 (★ 接线5: 时间衰减)"""
         count = 0
+
+        # ★ 懒加载 memory_timeline
+        mt = None
+        try:
+            from loongpearl.core.memory_timeline import MemoryTimeline
+            cg_db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+            if not hasattr(self, '_memory_timeline'):
+                self._memory_timeline = MemoryTimeline(db_path=cg_db_path)
+            mt = self._memory_timeline
+        except Exception as e:
+            log.debug(f"  MemoryTimeline 未就绪: {e}")
+
         for (s, r, o), bpa in self.fuzzy._bpas.items():
             if bpa.combined_mass > 0:
+                # ★ 时间衰减: 越久未验证的知识权重越低
+                combined_mass = bpa.combined_mass
+                try:
+                    if mt is not None:
+                        decay_factor = mt.time_decay_mass(s)
+                        combined_mass *= decay_factor
+                except Exception as e:
+                    log.debug(f"  时间衰减计算失败({s}): {e}")
+
+                if combined_mass <= 0:
+                    continue
+
                 if s in self.cg.triples:
                     for i, (rel, obj, conf, src) in enumerate(self._get_triples_for(s)):
                         if rel == r and obj == o:
-                            new_triple = (rel, obj, bpa.combined_mass, f"{src}+DS")
+                            new_triple = (rel, obj, combined_mass, f"{src}+DS")
                             self._get_triples_for(s)[i] = new_triple
                             count += 1
+
+                            # ★ 标记已验证时间
+                            try:
+                                if mt is not None:
+                                    mt.mark_verified(s, r, o)
+                            except Exception:
+                                pass
+
         if count:
             self._round_stats['d_s_feedbacks'] += count
-            log.debug(f"  🔄 D-S回写: {count} 条置信度更新")
+            log.debug(f"  🔄 D-S回写: {count} 条置信度更新 (含时间衰减)")
 
     # ═══════════════════════════════════════════════════════════════════
     # 守护循环 v2 — 信号驱动统一循环
@@ -1662,6 +1794,39 @@ class Orchestrator:
             except Exception as e:
                 log.warning(f"  EWC Fisher更新失败: {e}")
 
+        # ★ 接线4a: 每2轮验证驱动自主学习
+        if round_num % 2 == 0:
+            try:
+                from loongpearl.core.verified_learner import VerifiedLearner
+                from loongpearl.core.cognitive_terrain import CognitiveTerrain
+                from loongpearl.core.memory_timeline import MemoryTimeline
+
+                # 懒加载 verified_learner
+                if not hasattr(self, '_verified_learner'):
+                    cg_db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+                    wiki_db_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__)))),
+                        'data', 'wikipedia', 'zhwiki.db'
+                    )
+                    self._verified_learner = VerifiedLearner(
+                        db_path=cg_db_path,
+                        wiki_path=wiki_db_path,
+                    )
+                    log.info("  📚 VerifiedLearner 初始化完成")
+
+                vl_result = self._verified_learner.autonomous_tick(max_concepts=3)
+                if vl_result.get('concepts_learned', 0) > 0:
+                    tick_report['autonomous'] = {
+                        'concepts_learned': vl_result['concepts_learned'],
+                        'new_triples': vl_result.get('new_triples', 0),
+                        'conflicts_found': vl_result.get('conflicts_found', 0),
+                    }
+                    log.info(f"  🧠 自主学习: {vl_result['concepts_learned']}概念 "
+                            f"+{vl_result.get('new_triples', 0)}三元组")
+            except Exception as e:
+                log.debug(f"  自主学习未就绪: {e}")
+
         return tick_report
 
     # ── 大脑扫描 ──
@@ -1670,6 +1835,8 @@ class Orchestrator:
         """
         🧠 全因子盲区扫描。使用 MultiFactorDetector 从能量景观拓扑检测
         7类知识缺口，返回优先级队列。
+
+        ★ 接线4b: 合并 cognitive_terrain 检测到的概念盲区
         """
         from loongpearl.learning.blindspot_detector import MultiFactorDetector
         if not hasattr(self, '_detector'):
@@ -1678,7 +1845,38 @@ class Orchestrator:
                 num_partitions=8, from_landscape=True,
             )
         self._detector.scan_all(parallel=True)
-        return self._detector.top_gaps(100)
+        gaps = self._detector.top_gaps(100)
+
+        # ★ 合并 cognitive_terrain 盲区
+        try:
+            from loongpearl.core.cognitive_terrain import CognitiveTerrain
+            if not hasattr(self, '_terrain'):
+                cg_db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+                self._terrain = CognitiveTerrain(
+                    landscape_path=os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__)))),
+                        'data', 'models', 'energy_landscape.pt'
+                    ),
+                    field_path=None,
+                    db_path=cg_db_path,
+                )
+
+            blind_spots = self._terrain.top_blind_spots(n=20)
+            # 将 terrain 盲区追加为 gap 对象
+            for tp in blind_spots[:10]:
+                if tp.concept in self.field._char_to_idx:
+                    # 创建一个简单的 gap 对象
+                    class TerrainGap:
+                        def __init__(self, concept, energy):
+                            self.char = concept
+                            self.energy = energy
+                            self.factor = 'cognitive_terrain'
+                    gaps.append(TerrainGap(tp.concept, tp.energy))
+        except Exception as e:
+            log.debug(f"  cognitive_terrain 盲区合并异常: {e}")
+
+        return gaps
 
     # ── 双臂搜索 ──
 
@@ -2055,6 +2253,386 @@ class Orchestrator:
             f"  跨语言查: {self._round_stats['cross_lang_lookups']}",
         ]
         return "\n".join(lines)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ★ 生命体架构: 事件驱动主循环 (2026-06-20)
+    #
+    # 核心理念:
+    #   用户消息 只是 感知事件的一种。
+    #   内部盲区 / 好奇心 / 采集结果 同样是事件。
+    #   输入不保证输出 —— 表达是主动决策。
+    #   自主学习自驱动 —— 不是定时 cron job。
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ── 事件类型定义 ──
+
+    class EventType(Enum):
+        """事件类型 — 决定 process 行为和 express 决策"""
+        USER_MESSAGE      = auto()   # 用户输入 — 需要 NLU→推理→可能回答
+        INTERNAL_BLINDSPOT = auto()  # 认知地形发现盲区 — 触发学习，不表达
+        CURIOSITY         = auto()   # 学习后发现新缺口 — 继续探索，不表达
+        WIKI_RESULT       = auto()   # Wikipedia 采集回结果 — 静默写入，不表达
+        MEMORY_DECAY      = auto()   # 知识衰减 — 静默计算，不表达
+        TIMER            = auto()    # 定时器 — 定期维护（扰动/D-S/矛盾解等）
+
+    @dataclass
+    class LifeEvent:
+        """生命体事件 — 感知→内化→反思→表达的载体"""
+        etype: 'EventType'
+        payload: Dict[str, Any] = dc_field(default_factory=dict)
+        timestamp: float = dc_field(default_factory=time.time)
+        source: str = ""   # 事件源标识，用于调试追踪
+
+    def process_event(self, event: 'LifeEvent') -> Dict[str, Any]:
+        """
+        处理事件 → 更新内部状态。
+
+        返回处理结果，供 should_express 决策。
+        核心原则: 每个事件都更新内部状态（概念图/景观/记忆），
+        但只有部分事件触发表达。
+        """
+        etype = event.etype
+        payload = event.payload
+
+        if etype == self.EventType.USER_MESSAGE:
+            # 用户消息 → 走完整五步管道 → 返回结果
+            text = payload.get('text', '')
+            return self.query(text)
+
+        elif etype == self.EventType.INTERNAL_BLINDSPOT:
+            # 盲区 → 双臂搜索 → Hebbian 注入 → 静默
+            concept = payload.get('concept', '')
+            if concept:
+                pairs = self._arms_search_deep(concept, concept)
+                if pairs and self.learner:
+                    self.learner.learn_pairs_batch(pairs, learning_rate=0.05)
+            return {'signal': 'silent', 'concept': concept,
+                    'note': 'blind_spot_learned'}
+
+        elif etype == self.EventType.CURIOSITY:
+            # 好奇心 → 深入探索关联概念 → 静默
+            concept = payload.get('concept', '')
+            if concept:
+                try:
+                    from loongpearl.core.wiki_lookup import WikipediaLookup
+                    wiki_path = os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.dirname(
+                            os.path.abspath(__file__)))),
+                        'data', 'wikipedia', 'zhwiki.db'
+                    )
+                    wiki = WikipediaLookup(wiki_path)
+                    related = wiki.get_co_concepts(concept)
+                    if related and self.learner:
+                        # 注入关联字对
+                        pairs = []
+                        for co_char, co_freq in related[:20]:
+                            ia = self.field._char_to_idx.get(concept)
+                            ib = self.field._char_to_idx.get(co_char)
+                            if ia is not None and ib is not None:
+                                pairs.append((ia, ib))
+                        if pairs:
+                            self.learner.learn_pairs_batch(pairs, learning_rate=0.03)
+                except Exception:
+                    pass
+            return {'signal': 'silent', 'concept': concept,
+                    'note': 'curiosity_explored'}
+
+        elif etype == self.EventType.WIKI_RESULT:
+            # Wikipedia 采集结果 → 概念图注入 → 静默
+            triples = payload.get('triples', [])
+            for triple in triples[:50]:
+                try:
+                    self.cg.add_triple(
+                        triple.get('s', ''),
+                        triple.get('r', 'RELATED'),
+                        triple.get('o', ''),
+                        confidence=triple.get('c', 0.3),
+                        source='wiki_dump'
+                    )
+                except Exception:
+                    pass
+            return {'signal': 'silent',
+                    'note': f'wiki_injected_{len(triples)}_triples'}
+
+        elif etype == self.EventType.MEMORY_DECAY:
+            # 知识衰减 → 时间衰减计算 + D-S 回写 → 静默
+            try:
+                self._sync_fuzzy_to_cg()
+            except Exception:
+                pass
+            return {'signal': 'silent', 'note': 'decay_applied'}
+
+        elif etype == self.EventType.TIMER:
+            # 定期维护 → 执行 daemon_tick_v2 → 静默
+            round_num = payload.get('round_num', 0)
+            tick_report = self.daemon_tick_v2(round_num)
+            return {'signal': 'silent', 'note': 'timer_tick',
+                    'tick_report': tick_report}
+
+        return {'signal': 'unknown', 'note': f'unknown_event_{etype}'}
+
+    def should_express(self, event: 'LifeEvent',
+                       result: Dict[str, Any]) -> bool:
+        """
+        表达决策 — 决定是否输出给用户。
+
+        True 的情况: 用户消息始终需要回应
+        False 的情况: 内部事件静默处理（学习/采集/衰减/维护）
+        """
+        if event.etype == self.EventType.USER_MESSAGE:
+            return True
+        return False
+
+    # ── 事件源注册 ──
+
+    def register_event_sources(self) -> List[Callable[[], Generator['LifeEvent', None, None]]]:
+        """
+        注册所有事件源。
+
+        返回事件源生成器列表，主循环按 tick 遍历它们。
+        每个事件源是一个 generator，yield 零个或多个事件。
+
+        三个事件源:
+          1. stdin_source    — 交互模式: 从 stdin 读取用户输入
+          2. blindspot_source — 认知地形: 周期性扫描盲区
+          3. timer_source    — 定期维护: 扰动/D-S/矛盾解/衰减/裂变
+        """
+        sources = []
+
+        # ★ 事件源 1: 用户输入 (仅 --chat 模式)
+        # 标记需要额外处理 (stdin 需要阻塞读取，不能放进 generator yield 语义)
+        # → 在 run_lifeform 中特殊处理
+
+        # ★ 事件源 2: 认知地形盲区 (每 N 秒扫描)
+        def blindspot_source(interval: float = 30.0):
+            while True:
+                time.sleep(interval)
+                try:
+                    # 懒加载 cognitive_terrain
+                    if not hasattr(self, '_terrain'):
+                        from loongpearl.core.cognitive_terrain import CognitiveTerrain
+                        db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+                        self._terrain = CognitiveTerrain(
+                            landscape_path=None,
+                            field_path=None,
+                            db_path=db_path,
+                        )
+                        self._terrain.load()
+                        log.info("  🗺️ 认知地形加载完成 (盲区事件源)")
+
+                    blind_spots = self._terrain.top_blind_spots(n=5)
+                    for tp in blind_spots:
+                        if tp.concept:
+                            yield self.LifeEvent(
+                                etype=self.EventType.INTERNAL_BLINDSPOT,
+                                payload={'concept': tp.concept,
+                                        'energy': tp.energy},
+                                source='cognitive_terrain'
+                            )
+                except Exception as e:
+                    log.debug(f"  盲区扫描跳过: {e}")
+
+        sources.append(blindspot_source)
+
+        # ★ 事件源 3: 定期维护定时器
+        def timer_source(round_interval: int = 1):
+            """每 round_interval 秒发射一个 TIMER 事件"""
+            round_num = 0
+            while True:
+                time.sleep(round_interval)
+                round_num += 1
+                yield self.LifeEvent(
+                    etype=self.EventType.TIMER,
+                    payload={'round_num': round_num},
+                    source='timer'
+                )
+
+        sources.append(timer_source)
+
+        return sources
+
+    # ── 生命体主循环 ──
+
+    def run_lifeform(self, mode: str = 'chat'):
+        """
+        事件驱动主循环 — 替代 run_chat 和 run_daemon。
+
+        模式:
+          'chat'  — 用户交互 + 后台自主学习 (stdin 事件源 + 盲区 + 定时器)
+          'daemon' — 纯自主学习 (盲区 + 定时器)
+
+        核心循环:
+          while True:
+              event = 从所有事件源拉取
+              result = process(event)      → 更新概念图/景观/记忆
+              if should_express(event, result):
+                  output = render(result)   → 表达
+        """
+        import select as _select
+
+        running = True
+
+        # 注册信号处理（守护模式）
+        import signal
+        def _shutdown(sig, frame):
+            nonlocal running
+            log.info("\n🛑 收到停止信号, 保存后退出...")
+            running = False
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+
+        # 注册事件源 (仅守护模式需要后台事件源)
+        if mode == 'daemon':
+            event_sources = self.register_event_sources()
+            source_iters = []
+            if len(event_sources) >= 2:
+                source_iters.append(event_sources[0](interval=30.0))   # blindspot_source
+                source_iters.append(event_sources[1](round_interval=1)) # timer_source
+        else:
+            event_sources = []
+            source_iters = []
+
+        round_num = 0
+        last_express_time = time.time()
+
+        log.info(f"🧬 龙珠生命体架构 v4 启动 (模式: {mode})")
+        log.info(f"   事件源: {len(source_iters)} 个")
+
+        while running:
+            events_this_tick = []
+
+            # ── 用户输入 (仅 chat 模式，非阻塞读取 stdin) ──
+            if mode == 'chat':
+                try:
+                    # TTY 模式: select 非阻塞轮询；管道模式: readline 阻塞读取
+                    if sys.stdin.isatty():
+                        rlist, _, _ = _select.select([sys.stdin], [], [], 0.1)
+                        if not (rlist and sys.stdin in rlist):
+                            line = None
+                        else:
+                            line = sys.stdin.readline()
+                    else:
+                        # 管道/重定向模式: 不能用 select，直接 readline
+                        line = sys.stdin.readline()
+                        if not line:
+                            # EOF → 退出
+                            running = False
+                            break
+                    if line:
+                        text = line.strip()
+                        if not text:
+                            continue
+                        if text.lower() in ('quit', 'exit', 'q', '退出'):
+                            running = False
+                            break
+                        if text.lower() == 'status':
+                            print(self.status_report())
+                            sys.stdout.flush()
+                            continue
+                        if text.lower() == 'debug':
+                            self._show_debug = not getattr(self, '_show_debug', False)
+                            print(f"调试模式: {'开' if self._show_debug else '关'}")
+                            sys.stdout.flush()
+                            continue
+                            evt = self.LifeEvent(
+                                etype=self.EventType.USER_MESSAGE,
+                                payload={'text': text},
+                                source='stdin'
+                            )
+                            events_this_tick.append(evt)
+                except Exception:
+                    pass
+
+            # ── 从事件源拉取事件 ──
+            for src_iter in source_iters:
+                try:
+                    evt = next(src_iter)
+                    if evt is not None:
+                        events_this_tick.append(evt)
+                except StopIteration:
+                    log.warning("  事件源意外终止")
+                except Exception as e:
+                    log.debug(f"  事件源异常: {e}")
+
+            # ── 处理所有事件 ──
+            for evt in events_this_tick:
+                try:
+                    result = self.process_event(evt)
+
+                    # 表达决策
+                    if self.should_express(evt, result):
+                        answer = result.get('answer', '')
+                        if answer:
+                            # 花点时间输出，避免抢 stdin
+                            print(f"\n{answer}")
+                            if getattr(self, '_show_debug', False) and result.get('debug'):
+                                debug = result['debug']
+                                infer = debug.get('infer', {})
+                                print(f"  [信号: {result.get('signal', '?')} "
+                                      f"置信度: {result.get('confidence', 0):.0%}]")
+                                if infer.get('top_candidates'):
+                                    print(f"  [候选: {infer['top_candidates']}]")
+                            sys.stdout.flush()
+                            last_express_time = time.time()
+
+                            # ★ 表达后生成好奇心事件
+                            # 如果回答置信度低 → 系统自己生成一个探索事件
+                            signal_val = result.get('signal', 'certain')
+                            if signal_val in ('low_confidence', 'blind_spot', 'conflict'):
+                                concepts = result.get('debug', {}).get('frame', {}).get('concepts', [])
+                                for concept in concepts[:2]:
+                                    if concept and len(concept) <= 4:
+                                        curiosity_evt = self.LifeEvent(
+                                            etype=self.EventType.CURIOSITY,
+                                            payload={'concept': concept,
+                                                    'reason': f'low_confidence:{signal_val}'},
+                                            source='self_curiosity'
+                                        )
+                                        # 直接处理，不塞回队列（避免递归膨胀）
+                                        self.process_event(curiosity_evt)
+
+                except Exception as e:
+                    log.warning(f"  事件处理异常 [{evt.etype}]: {e}")
+
+            # ── 守护模式下定期保存 ──
+            if mode == 'daemon' and round_num > 0 and round_num % 5 == 0:
+                try:
+                    self.landscape.save(
+                        os.path.join(
+                            os.path.dirname(os.path.dirname(os.path.dirname(
+                                os.path.abspath(__file__)))),
+                            'data', 'models', 'energy_landscape_1024d.pt'
+                        )
+                    )
+                    log.debug(f"  💾 景观已保存 (轮次 {round_num})")
+                except Exception as e:
+                    log.warning(f"  保存失败: {e}")
+
+            round_num += 1
+
+        # ── 优雅停止 ──
+        log.info("💾 保存最终状态...")
+        try:
+            self.landscape.save(
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__)))),
+                    'data', 'models', 'energy_landscape_1024d.pt'
+                )
+            )
+        except Exception:
+            pass
+        try:
+            cg_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))),
+                'data', 'models', 'concept_graph'
+            )
+            if hasattr(self.cg, 'save'):
+                self.cg.save(cg_path)
+        except Exception:
+            pass
+        log.info("  龙珠生命体已停止。")
 
 
 # ═══════════════════════════════════════════════════════════════════════
