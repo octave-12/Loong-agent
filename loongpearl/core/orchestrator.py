@@ -2453,13 +2453,17 @@ class Orchestrator:
 
     # ── 生命体主循环 ──
 
-    def run_lifeform(self, mode: str = 'chat'):
+    def run_lifeform(self, mode: str = 'chat', timer_interval: int = 120):
         """
         事件驱动主循环 — 替代 run_chat 和 run_daemon。
 
         模式:
-          'chat'  — 用户交互 + 后台自主学习 (stdin 事件源 + 盲区 + 定时器)
-          'daemon' — 纯自主学习 (盲区 + 定时器)
+          'chat'  — 用户交互 (stdin 事件源)
+          'daemon' — 自主学习 (盲区 + 定时器)
+
+        Args:
+            mode: 'chat' | 'daemon'
+            timer_interval: 守护模式定时器间隔(秒)，默认 120
 
         核心循环:
           while True:
@@ -2472,7 +2476,7 @@ class Orchestrator:
 
         running = True
 
-        # 注册信号处理（守护模式）
+        # 注册信号处理
         import signal
         def _shutdown(sig, frame):
             nonlocal running
@@ -2487,7 +2491,7 @@ class Orchestrator:
             source_iters = []
             if len(event_sources) >= 2:
                 source_iters.append(event_sources[0](interval=30.0))   # blindspot_source
-                source_iters.append(event_sources[1](round_interval=1)) # timer_source
+                source_iters.append(event_sources[1](round_interval=timer_interval)) # timer_source
         else:
             event_sources = []
             source_iters = []

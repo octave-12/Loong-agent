@@ -428,7 +428,7 @@ def run_daemon(field, landscape, learner, args):
             was_locked = False
 
         # ★ 委托给统一的生命体循环
-        orch.run_lifeform(mode='daemon')
+        orch.run_lifeform(mode='daemon', timer_interval=args.interval)
         break  # run_lifeform 返回后退出
 
 
