@@ -84,6 +84,82 @@ def singleton_lock(name: str) -> bool:
     return True
 
 
+def _restart_daemon(pid_file: str, timeout: int = 150):
+    """
+    安全重启守护进程 — 仅杀精确 PID，绝不用名称模糊匹配。
+
+    1. 从 PID 文件读取旧进程 PID
+    2. 发送 SIGTERM 优雅停止
+    3. 轮询等待进程退出 (最长 timeout 秒)
+    4. 清理 PID 锁文件
+    5. 继续正常启动流程
+    """
+    if not os.path.exists(pid_file):
+        log.info("🔄 无旧守护进程 (PID 文件不存在)，直接启动")
+        return
+
+    try:
+        with open(pid_file) as f:
+            old_pid = int(f.read().strip())
+    except (ValueError, FileNotFoundError):
+        log.info("🔄 PID 文件无效，跳过停止旧进程")
+        return
+
+    # 验证进程存在且是龙珠守护（检查命令行）
+    try:
+        import subprocess
+        cmdline = subprocess.check_output(
+            ['cat', f'/proc/{old_pid}/cmdline'],
+            timeout=2, stderr=subprocess.DEVNULL
+        ).decode('utf-8', errors='replace').replace('\x00', ' ')
+        if 'loong_main' not in cmdline:
+            log.warning(f"⚠️ PID {old_pid} 不是龙珠进程 (cmdline={cmdline[:80]})，仅清理锁文件")
+            os.remove(pid_file)
+            return
+    except Exception:
+        # 进程可能已死
+        log.info(f"🔄 旧进程 PID {old_pid} 已不存在，清理锁文件")
+        try:
+            os.remove(pid_file)
+        except FileNotFoundError:
+            pass
+        return
+
+    # ── 发送 SIGTERM ──
+    log.info(f"🔄 正在优雅停止旧守护 (PID={old_pid})...")
+    try:
+        os.kill(old_pid, 15)  # SIGTERM
+    except ProcessLookupError:
+        log.info("  旧进程已退出")
+        os.remove(pid_file)
+        return
+
+    # ── 轮询等待退出 ──
+    waited = 0
+    while waited < timeout:
+        try:
+            os.kill(old_pid, 0)  # 检查进程是否存在
+        except ProcessLookupError:
+            log.info(f"  旧守护已退出 (等待 {waited}s)")
+            break
+        time.sleep(2)
+        waited += 2
+    else:
+        log.warning(f"  ⚠️ 超时 {timeout}s，旧进程未退出。强制 kill...")
+        try:
+            os.kill(old_pid, 9)  # SIGKILL 最后手段
+            time.sleep(2)
+        except ProcessLookupError:
+            pass
+
+    # ── 清理锁文件 ──
+    try:
+        os.remove(pid_file)
+    except FileNotFoundError:
+        pass
+    log.info("✅ 旧守护已停止，继续启动新进程")
+
+
 # ============================================================================
 # 模型加载
 # ============================================================================
@@ -513,6 +589,8 @@ def main():
     parser.add_argument('--interval', '-i', type=int, default=120)
     parser.add_argument('--max-learn', '-m', type=int, default=3)
     parser.add_argument('--max-rounds', '-n', type=int, default=0)
+    parser.add_argument('--restart', action='store_true',
+                       help='重启守护: 优雅停止旧进程 → 清理锁 → 启动新进程')
     parser.add_argument('--stage', type=int, default=0)
     parser.add_argument('--batch', type=int, default=16000)
     parser.add_argument('--epochs', type=int, default=3)
@@ -562,6 +640,13 @@ def main():
         mode_name = [k for k, v in new_modes.items() if v][0]
     else:
         mode_name = [k for k, v in old_modes.items() if v][0]
+
+    # ── 重启: 优雅停止旧守护 → 清理锁 → 继续启动 ──
+    if args.restart and mode_name == 'daemon':
+        _restart_daemon(
+            pid_file=os.path.join(PROJECT, 'logs', 'loong_daemon.pid'),
+            timeout=args.interval + 30
+        )
 
     if not singleton_lock(f'loong_{mode_name}'):
         sys.exit(1)
