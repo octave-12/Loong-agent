@@ -606,6 +606,108 @@ class ConversationEngine:
         self._used_fallbacks.add(topic)
         return f"我没理解你的意思。要不要换个话题？比如'{topic}'？"
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ★ Phase 3: 认知场替代正则闲聊 — respond_with_field()
+    # ═══════════════════════════════════════════════════════════════════
+
+    def respond_with_field(self, user_input: str,
+                           dragon_field=None, field_nlg=None,
+                           orch=None) -> Optional[str]:
+        """
+        使用认知场(DragonField+FieldNLG)生成自然闲聊回复。
+
+        替代 _CHITCHAT_TOPICS 中的硬编码模板（天气/情绪/时间等），
+        利用概念图中的知识生成有信息量的回复。
+
+        Args:
+            user_input:   用户输入
+            dragon_field: DragonField 实例 (Hopfield认知场)
+            field_nlg:    FieldNLG 实例 (场→文本解码器)
+            orch:         Orchestrator实例 (获取字场编码)
+
+        Returns:
+            生成的回复文本，或 None (回退到硬编码模板)
+        """
+        import torch
+
+        if dragon_field is None or dragon_field.num_patterns == 0:
+            return None
+
+        # 提取中文查询向量
+        query_chars = re.findall(r'[\u4e00-\u9fff]', user_input)
+        if not query_chars:
+            return None
+
+        try:
+            # 用字场编码查询
+            if orch and hasattr(orch, 'field'):
+                query_vec = self._encode_query(orch.field, query_chars)
+            else:
+                return None
+
+            # DragonField 认知场推理
+            field_result = dragon_field.converge(
+                query_vec, max_steps=20, convergence_threshold=1e-3
+            )
+
+            # ★ 质量门禁: 提取 top 概念，检查与输入的相关性
+            top_concepts = []
+            if field_result.top_pattern_indices:
+                for idx in field_result.top_pattern_indices[:5]:
+                    if 0 <= idx < len(dragon_field._pattern_subjects):
+                        top_concepts.append(dragon_field._pattern_subjects[idx])
+
+            # 无汉字重叠 → DragonField 匹配偏离，回退模板
+            if top_concepts and query_chars:
+                concat = ''.join(top_concepts)
+                overlap = sum(1 for ch in query_chars if ch in concat)
+                if overlap == 0:
+                    return None  # 回退到硬编码模板
+
+            # FieldNLG 生成回复
+            if field_nlg and field_result.is_retrieval:
+                answer = field_nlg.render(field_result, user_input)
+                if answer and len(answer) > 5:
+                    return answer
+
+            # 认知场无法生成好回复 → 用概念图关联构建自然回复
+            if field_result.top_pattern_indices:
+                top_concepts = []
+                for idx in field_result.top_pattern_indices[:5]:
+                    if 0 <= idx < len(dragon_field._pattern_subjects):
+                        top_concepts.append(dragon_field._pattern_subjects[idx])
+
+                if top_concepts:
+                    # 构建"你让我想到了..." 的自然回复
+                    concepts_str = "、".join(top_concepts[:3])
+                    patterns = [
+                        f"这个话题让我想到了：{concepts_str}。想深入了解哪一个？",
+                        f"说到这个，我联想到了{concepts_str}。你对哪个感兴趣？",
+                        f"嗯… 我在知识库里找到了{concepts_str}等概念。想聊聊哪个？",
+                    ]
+                    return random.choice(patterns)
+
+        except Exception:
+            pass
+
+        return None
+
+    def _encode_query(self, field, query_chars: List[str]) -> "torch.Tensor":
+        """将查询字序列编码为字场向量"""
+        import torch
+        device = 'cpu'
+        if hasattr(field, 'anchors') and field.anchors is not None:
+            device = field.anchors.device
+
+        vecs = []
+        for ch in query_chars[:10]:
+            idx = field._char_to_idx.get(ch)
+            if idx is not None:
+                vecs.append(field.anchors[idx].to(device))
+        if vecs:
+            return torch.stack(vecs).mean(dim=0)
+        return torch.zeros(1024, device=device)
+
     def status(self) -> Dict[str, Any]:
         """返回对话状态摘要"""
         return {

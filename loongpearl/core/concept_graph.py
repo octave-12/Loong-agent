@@ -1682,6 +1682,54 @@ class ConceptGraph:
         self._dirty_since_last_save = False
         print(f"概念图已加载: {len(self.nodes)}节点 {self.total_triples}三元组")
 
+    def load_from_db(self, db_path: str, batch_size: int = 100000):
+        """从 SQLite 流式加载概念图 — 避免大 JSON 内存溢出
+        
+        Args:
+            db_path: concept_graph.db 路径
+            batch_size: 每批读取行数
+        """
+        import sqlite3
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(f"数据库不存在: {db_path}")
+        
+        self.triples.clear()
+        self.forward_index.clear()
+        self.reverse_index.clear()
+        self._char_adjacency.clear()
+        self.total_triples = 0
+        
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        total_db = conn.execute("SELECT COUNT(*) FROM triples").fetchone()[0]
+        
+        cursor = conn.execute(
+            "SELECT s, r, o, c, src, ev FROM triples WHERE c >= 0.5 ORDER BY c DESC LIMIT 5000000"
+        )
+        loaded = 0
+        
+        while True:
+            rows = cursor.fetchmany(batch_size)
+            if not rows:
+                break
+            for row in rows:
+                # 防御 ev 字段中的非数字值
+                try:
+                    ev = int(float(row['ev']))
+                except (ValueError, TypeError):
+                    ev = 1
+                self.add_triple(
+                    row['s'], row['r'], row['o'],
+                    confidence=row['c'],
+                    source=row['src'] or 'unknown',
+                    evidence_count=ev,
+                )
+            loaded += len(rows)
+        
+        conn.close()
+        self._dirty_since_last_save = False
+        print(f"概念图已从DB加载: {len(self.nodes)}节点 {self.total_triples}三元组 (DB共{total_db}条)")
+
     @classmethod
     def create_with_seeds(cls, field, landscape=None, all_domains: bool = True) -> "ConceptGraph":
         """

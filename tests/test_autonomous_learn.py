@@ -141,7 +141,7 @@ stats = learner.get_stats()
 print(f"  学习器总学习: {stats['total_learns']}")
 print(f"  学习器总衰减: {stats['total_decays']}")
 if stats.get('top_active'):
-    print(f"  最活跃字: {', '.join(stats['top_active'])}")
+    print(f"  最活跃字: {stats['top_active'][:5]}")
 
 print(f"\n✅ 端到端测试完成!")
 

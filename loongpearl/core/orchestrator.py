@@ -72,6 +72,11 @@ class Orchestrator:
         self._perturbation = None    # ★ 对抗扰动引擎
         self._ds_generator = None    # ★ D-S假设生成器
         self._gradient_reverse = None  # ★ 梯度反推引擎
+        self._dragon_field = None    # ★ v4 认知场 (Hopfield)
+        self._field_nlg = None       # ★ v4 场→文本解码器
+        self._sequence_field = None  # ★ v4 序列场 (Markov, 双场架构下半场)
+        self._fission = None         # ★ v4 裂变管理器
+        self._learning_dag = None    # ★ v4 学习依赖DAG
 
         # ★ 优先学习管道: 交互模式"超出知识范围"→写入队列→守护模式插队处理
         self._pending_path = os.path.join(
@@ -359,9 +364,41 @@ class Orchestrator:
         result = {"output": "", "debug": {}, "type": "unknown"}
 
         conv_result = self.conversation.respond(query)
-        if conv_result["type"] in ("social", "chitchat"):
+        if conv_result["type"] == "social":
             result["output"] = conv_result["output"]
             result["type"] = conv_result["type"]
+            return result
+
+        # ★ Phase 3: 闲聊走认知场 (替代硬编码模板)
+        if conv_result["type"] == "chitchat":
+            result['debug']['routing'] = 'chitchat'
+            df = getattr(self, '_dragon_field', None)
+            fn = getattr(self, '_field_nlg', None)
+            field_reply = None
+            if df is not None and df.num_patterns > 0:
+                try:
+                    field_reply = self.conversation.respond_with_field(
+                        question_text, dragon_field=df, field_nlg=fn, orch=self
+                    )
+                except Exception:
+                    pass
+            if field_reply and len(field_reply) > 5:
+                result['raw_answer'] = field_reply
+                result['signal'] = 'certain'
+                result['confidence'] = 0.85
+                result['answer'] = self._generate_answer(
+                    question_text, result, source="chat"
+                )
+                result['debug']['chitchat_source'] = 'dragon_field'
+                return result
+            # 回退到硬编码模板
+            result['raw_answer'] = conv_result["output"]
+            result['signal'] = 'certain'
+            result['confidence'] = 0.7
+            result['answer'] = self._generate_answer(
+                question_text, result, source="chat"
+            )
+            result['debug']['chitchat_source'] = 'template'
             return result
 
         if conv_result.get("enhanced_query") and conv_result["enhanced_query"] != query:
@@ -683,7 +720,7 @@ class Orchestrator:
 
         # 非知识查询直接走对应引擎
         conv_result = self.conversation.respond(question_text)
-        if conv_result["type"] in ("social", "chitchat"):
+        if conv_result["type"] == "social":
             result['raw_answer'] = conv_result["output"]  # ★ 统一字段
             result['signal'] = 'certain'
             result['confidence'] = 1.0
@@ -776,19 +813,47 @@ class Orchestrator:
             return result
 
         # ── 第三步: 能量景观梯度下降推理 ──
-        infer_result = self.landscape.infer(
-            query_vec,
-            steps=50,
-            lr=0.02,
-            zichang=self.field,  # ★ 传入字场以启用信号发射
-        )
-        result['debug']['infer'] = {
-            'signal': infer_result['signal'],
-            'energy': infer_result['energy'],
-            'steps': infer_result['steps'],
-            'gradient_norm': infer_result.get('gradient_norm', 0),
-            'top_candidates': infer_result.get('top_candidates', []),
-        }
+        # ★ v4: 优先使用 DragonField (Hopfield), 回退到旧景观
+        df = getattr(self, '_dragon_field', None)
+        if df is not None and df.num_patterns > 0:
+            try:
+                field_result = df.converge(
+                    query_vec, max_steps=30, convergence_threshold=1e-4,
+                )
+                # 映射 FieldResult → 旧格式兼容 _handle_signal
+                infer_result = self._field_to_infer(field_result)
+                result['debug']['infer'] = {
+                    'engine': 'dragon_field',
+                    'signal': infer_result['signal'],
+                    'energy': infer_result['energy'],
+                    'steps': infer_result['steps'],
+                    'basin_depth': field_result.basin_depth,
+                    'saddle_gap': field_result.saddle_gap,
+                    'confidence_label': field_result.confidence_label,
+                }
+            except Exception as e:
+                log.warning(f"DragonField推理失败, 回退到旧景观: {e}")
+                infer_result = self.landscape.infer(
+                    query_vec, steps=50, lr=0.02, zichang=self.field,
+                )
+                result['debug']['infer'] = {
+                    'engine': 'landscape(fallback)',
+                    'signal': infer_result['signal'],
+                    'energy': infer_result['energy'],
+                    'steps': infer_result['steps'],
+                }
+        else:
+            infer_result = self.landscape.infer(
+                query_vec, steps=50, lr=0.02, zichang=self.field,
+            )
+            result['debug']['infer'] = {
+                'engine': 'landscape',
+                'signal': infer_result['signal'],
+                'energy': infer_result['energy'],
+                'steps': infer_result['steps'],
+                'gradient_norm': infer_result.get('gradient_norm', 0),
+                'top_candidates': infer_result.get('top_candidates', []),
+            }
 
         # ── 第四步: 信号处理闭环 ──
         final_result = self._handle_signal(question_text, query_vec, infer_result)
@@ -800,12 +865,76 @@ class Orchestrator:
             'energy': final_result['energy'],
         }
 
+        # ★ Phase 5: 引擎反转 — 低置信度时触发扰动验证
+        if final_result['signal'] in ('low_confidence', 'conflict', 'blind_spot'):
+            try:
+                pert = getattr(self, '_perturbation', None)
+                if pert is not None:
+                    perturb_report = pert.perturb(
+                        query_vec, final_result.get('_field_result')
+                    )
+                    if perturb_report and perturb_report.corrections:
+                        result['debug']['perturbation'] = {
+                            'corrections': len(perturb_report.corrections),
+                            'verified': perturb_report.n_corrected,
+                        }
+                        for correction in perturb_report.corrections:
+                            try:
+                                self.cg.add_triple(
+                                    correction.get('s', ''),
+                                    correction.get('r', 'RELATED'),
+                                    correction.get('o', ''),
+                                    confidence=correction.get('c', 0.5),
+                                    source='perturbation_verify'
+                                )
+                            except Exception:
+                                pass
+            except Exception as e:
+                log.debug(f"  扰动验证跳过: {e}")
+
         # ── 第五步: 生成回答 ──
         result['answer'] = self._generate_answer(
             question_text, final_result, source="knowledge"
         )
 
         return result
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ★ v4: DragonField → 旧 infer 格式映射
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _field_to_infer(self, fr) -> Dict:
+        """FieldResult → landscape.infer() 兼容格式"""
+        # 信号映射
+        if fr.is_retrieval:
+            signal = 'certain'
+        elif fr.is_emergent:
+            signal = 'low_confidence'
+        elif fr.saddle_gap < 0.05:
+            signal = 'conflict'
+        else:
+            signal = 'blind_spot'
+
+        # 解析 top 汉字 (从 pattern_subjects)
+        top_candidates = []
+        df = getattr(self, '_dragon_field', None)
+        if df is not None:
+            for idx in fr.top_pattern_indices:
+                if 0 <= idx < len(df._pattern_subjects):
+                    top_candidates.append(df._pattern_subjects[idx])
+
+        return {
+            'state': fr.convergent_vector,
+            'energy': fr.energy,
+            'steps': fr.convergence_steps,
+            'converged': True,
+            'signal': signal,
+            'signal_detail': fr.confidence_label,
+            'gradient_norm': 0.0,
+            'top_candidates': top_candidates[:5],
+            'top_similarities': fr.top_similarities[:5],
+            '_field_result': fr,  # ★ 保留原始 FieldResult 供 FieldNLG 使用
+        }
 
     # ═══════════════════════════════════════════════════════════════════
     # ★ 第四步核心: 信号驱动的闭环处理
@@ -1307,6 +1436,14 @@ class Orchestrator:
     # ★ 第五步: 化能器生成回答 — 置信度原生标注
     # ═══════════════════════════════════════════════════════════════════
 
+    def _render_legacy(self, result: Dict, question: str) -> str:
+        """旧解码器回退 (当 FieldNLG 不可用时)"""
+        top_chars = result.get('top_candidates', [])
+        converge_state = result.get('state')
+        if converge_state is not None and top_chars:
+            return self._decode_state(converge_state, top_chars, question)
+        return f"关于「{question}」，目前的知识不完整。"
+
     def _generate_answer(self, question: str, result: Dict,
                          source: str = "knowledge") -> str:
         """
@@ -1358,14 +1495,76 @@ class Orchestrator:
 
             answer_body = '\n'.join(parts) if parts else f"关于「{question}」，暂未找到足够的结构化知识。"
 
-        # === 知识推理: 直接解码 ===
+        # === 知识推理: ★ 双场架构 (语义场 → 序列场) ===
         elif source == "knowledge":
-            top_chars = result.get('top_candidates', [])
-            converge_state = result.get('state')
-            if converge_state is not None and top_chars:
-                answer_body = self._decode_state(converge_state, top_chars, question)
-            else:
-                answer_body = f"关于「{question}」，目前的知识不完整。"
+            field_result = result.get('_field_result')
+
+            # ★ 双场: 语义场收敛找到盆 → 序列场 Markov walk 生成
+            if field_result is not None:
+                sf = getattr(self, '_sequence_field', None)
+                if sf is not None and sf.global_stats()['num_basins'] > 0:
+                    query_chars = re.findall(r'[\u4e00-\u9fff]', question)
+
+                    # ★ 盆地匹配: 通过查询字找最佳序列场盆
+                    # (DragonField 的 pattern_subjects 是单字共现，不适用于盆匹配)
+                    basin_idx = getattr(self, '_basin_index', None)
+                    basin, alt_basins = None, []
+
+                    if basin_idx and query_chars:
+                        # 找包含最多查询字的盆, 短盆名优先(精确概念)
+                        candidates = {}
+                        for ch in query_chars:
+                            if ch in basin_idx:
+                                for bn in basin_idx[ch]:
+                                    overlap = sum(1 for c in query_chars if c in bn)
+                                    if overlap > 0:
+                                        if bn not in candidates:
+                                            candidates[bn] = [0, len(bn)]
+                                        candidates[bn][0] += overlap
+                        if candidates:
+                            ranked = sorted(
+                                candidates.items(),
+                                key=lambda x: (-x[1][0], x[1][1])
+                            )
+                            basin = ranked[0][0]
+                            alt_basins = [b for b, _ in ranked[1:3]]
+
+                    if basin:
+                        try:
+                            field_output = sf.walk_bidirectional(
+                                basin_subject=basin,
+                                seed_chars=query_chars if query_chars else ['?'],
+                                length=24,
+                                temperature=0.7,
+                                fallback_basins=alt_basins,
+                            )
+                            # 质量控制: 至少3个汉字且不完全重复
+                            if field_output and len(field_output) >= 3:
+                                # 去首尾空白
+                                field_output = field_output.strip()
+                                # 合并连续重复字
+                                dedup = []
+                                for ch in field_output:
+                                    if '\u4e00' <= ch <= '\u9fff':
+                                        if len(dedup) < 2 or ch != dedup[-1] or ch != dedup[-2]:
+                                            dedup.append(ch)
+                                field_output = ''.join(dedup)
+                                if len(field_output) >= 3:
+                                    answer_body = field_output
+                                    result['debug']['nlg_source'] = 'dual_field'
+                                    result['debug']['basin'] = basin
+                        except Exception as e:
+                            log.debug(f"序列场 walk 失败: {e}")
+
+            # 回退链: 场生语言 → FieldNLG → 旧解码器
+            if 'nlg_source' not in result.get('debug', {}):
+                if field_result is not None and hasattr(self, '_field_nlg') and self._field_nlg:
+                    try:
+                        answer_body = self._field_nlg.render(field_result, question)
+                    except Exception:
+                        answer_body = self._render_legacy(result, question)
+                else:
+                    answer_body = self._render_legacy(result, question)
 
         # === 对话/创意: 模糊保护 — 编码→景观推理→置信度标注 ===
         else:
@@ -1373,46 +1572,51 @@ class Orchestrator:
             if not raw_answer:
                 raw_answer = f"关于「{question}」的回应"
 
-            # 编码为向量并在能量景观中评估
-            try:
-                query_chars = re.findall(r'[\u4e00-\u9fff]', question)
-                if query_chars:
-                    device = next(self.landscape.parameters()).device
-                    vecs = []
-                    for ch in query_chars[:10]:
-                        idx = self.field._char_to_idx.get(ch)
-                        if idx is not None:
-                            vecs.append(self.field.anchors[idx].to(device))
-                    if vecs:
-                        answer_vec = torch.stack(vecs).mean(dim=0)
-                        verify_result = self.landscape.infer(
-                            answer_vec, steps=30, lr=0.01,
-                            zichang=self.field
-                        )
-                        verify_signal = verify_result.get('signal', 'certain')
+            # ★ Phase 3: 闲聊跳过景观模糊保护
+            is_chitchat = result.get('debug', {}).get('routing') == 'chitchat'
+            if is_chitchat:
+                answer_body = raw_answer
+            else:
+                # 编码为向量并在能量景观中评估
+                try:
+                    query_chars = re.findall(r'[\u4e00-\u9fff]', question)
+                    if query_chars:
+                        device = next(self.landscape.parameters()).device
+                        vecs = []
+                        for ch in query_chars[:10]:
+                            idx = self.field._char_to_idx.get(ch)
+                            if idx is not None:
+                                vecs.append(self.field.anchors[idx].to(device))
+                        if vecs:
+                            answer_vec = torch.stack(vecs).mean(dim=0)
+                            verify_result = self.landscape.infer(
+                                answer_vec, steps=30, lr=0.01,
+                                zichang=self.field
+                            )
+                            verify_signal = verify_result.get('signal', 'certain')
 
-                        if verify_signal == 'certain':
-                            signal = 'certain'
-                            answer_body = raw_answer
-                        elif verify_signal == 'blind_spot':
-                            signal = 'low_confidence'
-                            result['note'] = '此回答为创意联想，龙珠对此领域的知识有限'
-                            answer_body = raw_answer
-                        elif verify_signal == 'conflict':
-                            signal = 'low_confidence'
-                            result['note'] = '回答涉及的概念存在知识冲突'
-                            answer_body = raw_answer
+                            if verify_signal == 'certain':
+                                signal = 'certain'
+                                answer_body = raw_answer
+                            elif verify_signal == 'blind_spot':
+                                signal = 'low_confidence'
+                                result['note'] = '此回答为创意联想，龙珠对此领域的知识有限'
+                                answer_body = raw_answer
+                            elif verify_signal == 'conflict':
+                                signal = 'low_confidence'
+                                result['note'] = '回答涉及的概念存在知识冲突'
+                                answer_body = raw_answer
+                            else:
+                                signal = 'low_confidence'
+                                result['note'] = '以下回答仅供参考'
+                                answer_body = raw_answer
                         else:
-                            signal = 'low_confidence'
-                            result['note'] = '以下回答仅供参考'
                             answer_body = raw_answer
                     else:
                         answer_body = raw_answer
-                else:
+                except Exception:
+                    # 评估失败不影响主流程
                     answer_body = raw_answer
-            except Exception:
-                # 评估失败不影响主流程
-                answer_body = raw_answer
 
         # === 置信度标签 ===
         if signal == 'certain':
@@ -1795,7 +1999,16 @@ class Orchestrator:
             except Exception as e:
                 log.warning(f"  EWC Fisher更新失败: {e}")
 
-        # ★ 接线4a: 每2轮验证驱动自主学习
+        # ★ Phase 4: 裂变管理 — 每10轮检查知识增长，触发裂变/融合
+        if round_num % 10 == 0:
+            try:
+                fission_report = self._run_fission_check()
+                if fission_report:
+                    tick_report['fission'] = fission_report
+            except Exception as e:
+                log.debug(f"  裂变检查异常: {e}")
+
+        # ★ 接线4a: 每2轮验证驱动自主学习 (DAG引导)
         if round_num % 2 == 0:
             try:
                 from loongpearl.core.verified_learner import VerifiedLearner
@@ -1816,7 +2029,34 @@ class Orchestrator:
                     )
                     log.info("  📚 VerifiedLearner 初始化完成")
 
+                # ★ Phase 4: DAG拓扑排序引导学习优先级
+                dag_concepts = None
+                try:
+                    if not hasattr(self, '_learning_dag') or self._learning_dag is None:
+                        try:
+                            from loongpearl.core.learning_dag import LearningDAG
+                            cg_db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+                            self._learning_dag = LearningDAG(db_path=cg_db_path)
+                            self._learning_dag.build(min_conf=0.5)
+                            dag_stats = self._learning_dag.stats()
+                            log.info(f"  🗺️ LearningDAG: {dag_stats['total_nodes']}节点 "
+                                    f"{dag_stats['total_edges']}边 "
+                                    f"(根={dag_stats['roots']}, 叶={dag_stats['leaves']})")
+                        except Exception as e:
+                            log.debug(f"  LearningDAG构建跳过: {e}")
+                            self._learning_dag = None
+
+                    if self._learning_dag is not None:
+                        order = self._learning_dag.topological_order()
+                        if order:
+                            dag_concepts = order[:10]
+                except Exception:
+                    dag_concepts = None
+
                 vl_result = self._verified_learner.autonomous_tick(max_concepts=3)
+                # ★ Phase 4: DAG引导 — 记录拓扑排序前5概念
+                if dag_concepts:
+                    tick_report['dag_top'] = dag_concepts[:5]
                 if vl_result.get('concepts_learned', 0) > 0:
                     tick_report['autonomous'] = {
                         'concepts_learned': vl_result['concepts_learned'],
@@ -2040,6 +2280,36 @@ class Orchestrator:
         fg_stats = self.fuzzy.stats()
         return {"evidences_added": added, "propositions": fg_stats['propositions'],
                 "d_s_feedbacks": self._round_stats['d_s_feedbacks']}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # ★ Phase 4: FissionManager — 裂变检查与融合同步
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _run_fission_check(self) -> Dict:
+        """每10轮检查知识增长，触发裂变/融合。"""
+        try:
+            from loongpearl.core.fission import FissionManager
+            if not hasattr(self, '_fission') or self._fission is None:
+                cg_db_path = self.cg.db_path if hasattr(self.cg, 'db_path') else None
+                self._fission = FissionManager(db_path=cg_db_path)
+                self._last_fusion_triple_count = self._fission.shared.get_triple_count()
+                log.info(f"  🐉 FissionManager初始化: "
+                        f"{self._last_fusion_triple_count}条共享三元组")
+            report = {'action': 'scan'}
+            current_count = self._fission.shared.get_triple_count()
+            growth = current_count - getattr(self, '_last_fusion_triple_count', current_count)
+            if growth > 0:
+                report['growth'] = growth
+                report['total'] = current_count
+                self._last_fusion_triple_count = current_count
+                if growth > 1000:
+                    log.info(f"  🔄 裂变融合: +{growth}条新三元组")
+            contributions = self._fission.shared.get_instance_contributions()
+            if contributions:
+                report['instances'] = len(contributions)
+            return report
+        except Exception as e:
+            return {'error': str(e)}
 
     def _plan_learning_targets_v2(self) -> Dict:
         """策应器学习规划 — 使用 forward_index"""
@@ -2675,6 +2945,7 @@ def create_orchestrator(field, landscape, learner=None) -> Orchestrator:
     _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     CONCEPT_GRAPH_BASE = os.path.join(_project_root, 'data', 'models', 'concept_graph')
     FALLBACK_BASE = os.path.join(_project_root, 'loongpearl', 'data', 'models', 'concept_graph')
+    DB_PATH = os.path.join(_project_root, 'data', 'models', 'concept_graph.db')
     cg = ConceptGraph(field, landscape)
     
     # 尝试加载概念图（主路径 → 备份路径）
@@ -2689,10 +2960,11 @@ def create_orchestrator(field, landscape, learner=None) -> Orchestrator:
                 log.info(f"概念图从备份加载: {base}.json")
             break
         except Exception as e:
-            log.warning(f"概念图加载失败 ({base}): {e}")
+            log.warning(f"概念图JSON加载失败 ({base}): {e}")
     
-    if not loaded:
-        log.warning("⚠️ 概念图加载失败且无备份，以空概念图启动（仅在线学习可用）")
+    # 大概念图从 SQLite 查询（_cgdb），不在内存加载
+    if not loaded and os.path.exists(DB_PATH):
+        log.info(f"概念图将直接从SQLite查询 (DB有{os.path.getsize(DB_PATH)//(1024*1024)}MB, 跳过内存加载)")
     elif cg.total_triples == 0:
         log.warning("⚠️ 概念图为空（0三元组），以空概念图启动")
     
@@ -2716,6 +2988,62 @@ def create_orchestrator_with_sequential(field, landscape, learner=None) -> Orche
     except Exception as e:
         log.warning(f"  SQLite加速初始化失败: {e}")
         orch._cgdb = None
+
+    # ★ DragonField v4 认知场 (Hopfield) — 替代旧能量景观
+    try:
+        from loongpearl.core.dragon_field import DragonField
+        df_cache = os.path.join(_project_root, 'data', 'models', 'dragon_field_patterns.pt')
+        orch._dragon_field = DragonField(embed_dim=1024, beta=8.0)
+        if os.path.exists(df_cache):
+            data = torch.load(df_cache, map_location='cpu')
+            orch._dragon_field.store_patterns(
+                data['vectors'], data['ids'], data['subjects'],
+            )
+            log.info(f"  DragonField: {orch._dragon_field.num_patterns}个概念模式已加载")
+        else:
+            log.info("  DragonField: 就绪 (模式缓存未构建, 查询回退到旧景观)")
+    except Exception as e:
+        log.warning(f"  DragonField初始化跳过: {e}")
+        orch._dragon_field = None
+
+    # ★ SequenceField v4 序列场 (Markov) — 双场架构下半场
+    try:
+        from loongpearl.core.sequence_field import SequenceField
+        sf_cache = os.path.join(_project_root, 'data', 'models', 'sequence_field.json')
+        if os.path.exists(sf_cache):
+            orch._sequence_field = SequenceField.load(sf_cache)
+            stats = orch._sequence_field.global_stats()
+            log.info(f"  SequenceField: {stats['num_basins']}个盆, "
+                     f"{stats['total_bigrams']} bigrams 已加载")
+
+            # ★ 构建盆名倒排索引: 字 → 盆名列表 (用于快速盆地匹配)
+            orch._basin_index = {}
+            for basin_name in orch._sequence_field._basin_forward.keys():
+                for ch in basin_name:
+                    if '\u4e00' <= ch <= '\u9fff':
+                        if ch not in orch._basin_index:
+                            orch._basin_index[ch] = []
+                        orch._basin_index[ch].append(basin_name)
+            for ch in orch._basin_index:
+                orch._basin_index[ch] = list(set(orch._basin_index[ch]))
+            log.info(f"  BasinIndex: {len(orch._basin_index)}字→盆倒排就绪")
+        else:
+            log.info("  SequenceField: 就绪 (缓存未构建, 将回退到 FieldNLG)")
+    except Exception as e:
+        log.warning(f"  SequenceField初始化跳过: {e}")
+        orch._sequence_field = None
+
+    # ★ FieldNLG v4 场→文本解码器 — 替代旧 HybridDecoder
+    try:
+        from loongpearl.core.field_nlg import FieldNLG
+        orch._field_nlg = FieldNLG(
+            db_path=db_path,
+            pattern_ids=orch._dragon_field._pattern_ids if orch._dragon_field else None
+        )
+        log.info("  FieldNLG: 场→文本解码器就绪")
+    except Exception as e:
+        log.warning(f"  FieldNLG初始化跳过: {e}")
+        orch._field_nlg = None
 
     # ★ DualExtractor: 正则+LLM双重知识提取
     try:

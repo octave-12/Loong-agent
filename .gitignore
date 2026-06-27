@@ -50,3 +50,31 @@ data/models/energy_pyramid.pt
 data/models/energy_pyramid_deep.pt
 data/models/energy_landscape_1024d.pt
 data/models/*.pt.backup
+data/models/*.bak
+data/models/*.bak.*
+data/models/*.db
+data/models/*.db-shm
+data/models/*.db-wal
+data/models/*.safetensors
+data/models/*.post_cg_inject
+data/models/sequence_field.json
+data/models/concept_graph.json
+data/models/concept_graph.json.*
+data/models/dragon_field_meta.json
+data/instances/
+data/wikipedia/
+data/zhwikibooks.xml.bz2
+data/zhwiktionary.xml.bz2
+
+# ── 构建产物 ──
+dist/
+
+# ── 备份文件 ──
+*.bak
+
+# ── Hermes 计划文件 ──
+.hermes/
+.arts/
+
+# ── 测试报告 ──
+tests/scenario_report_*.json

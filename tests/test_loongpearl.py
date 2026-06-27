@@ -24,12 +24,14 @@ def print_section(title: str):
     print(f"{'─' * 50}")
 
 
+MODEL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 def test_initialization():
     """测试1: 初始化龙珠"""
     print_section("测试1: 初始化龙珠")
     
     t0 = time.time()
-    loongpearl = LoongPearl()
+    loongpearl = LoongPearl(model_dir=MODEL_DIR)
     loongpearl.initialize(verbose=True)
     elapsed = time.time() - t0
     
